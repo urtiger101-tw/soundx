@@ -34,8 +34,8 @@ Skill 與 MCP 設定。內建 stdio server 以 `soundx mcp` 啟動；可攜版�
 
 ```bash
 # 從原始碼建置
-git clone https://github.com/urtiger101-tw/sox-rs.git
-cd sox-rs
+git clone https://github.com/urtiger101-tw/soundx.git
+cd soundx
 cargo build --release
 ./target/release/soundx --help
 # 或安裝至 Cargo 的 bin 目錄
@@ -98,7 +98,7 @@ soundx convert input.wav lossless.wv
 
 ### 預編譯二進位檔
 
-從 [GitHub Releases](https://github.com/stevenke1981/sox-rs/releases) 下載：
+從 [GitHub Releases](https://github.com/urtiger101-tw/soundx/releases) 下載：
 
 | 平台 | 套件 | 執行檔 |
 |------|------|--------|

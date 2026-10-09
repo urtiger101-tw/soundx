@@ -36,8 +36,8 @@ See [agent setup and tools](../../docs/AGENT_INTEGRATION.md) for all commands.
 
 ```bash
 # Build from source
-git clone https://github.com/urtiger101-tw/sox-rs.git
-cd sox-rs
+git clone https://github.com/urtiger101-tw/soundx.git
+cd soundx
 cargo build --release
 ./target/release/soundx --help
 # Or install into Cargo's bin directory
@@ -100,7 +100,7 @@ soundx convert input.wav lossless.wv
 
 ### Pre-built binaries
 
-Download from [GitHub Releases](https://github.com/stevenke1981/sox-rs/releases):
+Download from [GitHub Releases](https://github.com/urtiger101-tw/soundx/releases):
 
 | Platform | Package | Binary |
 |----------|---------|--------|

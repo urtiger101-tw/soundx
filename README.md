@@ -11,8 +11,8 @@
 
 ```bash
 # 從原始碼建置
-git clone https://github.com/urtiger101-tw/sox-rs.git
-cd sox-rs
+git clone https://github.com/urtiger101-tw/soundx.git
+cd soundx
 cargo build --release
 ./target/release/soundx --help
 
