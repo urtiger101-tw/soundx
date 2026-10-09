@@ -1,6 +1,6 @@
 [package]
 name = "soundx"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 description = "A Rust-first, SoX-inspired audio processor"
@@ -48,3 +48,8 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# The size-optimised profile above keeps third-party codecs small, but the
+# loudness/limiter DSP loops need vectorisation; optimise this crate for speed.
+[profile.release.package.soundx]
+opt-level = 3

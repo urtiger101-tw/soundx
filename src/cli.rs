@@ -16,6 +16,8 @@ pub struct Cli {
 pub enum Commands {
     /// Print WAV metadata and level statistics.
     Info(InfoArgs),
+    /// Measure ITU-R BS.1770-4 / EBU R128 loudness, loudness range and true peak.
+    Loudness(LoudnessArgs),
     /// List built-in format support.
     Formats,
     /// List available system audio input and output devices.
@@ -142,6 +144,15 @@ pub struct InfoArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct LoudnessArgs {
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// Print one JSON array with an object per input.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct PlayArgs {
     #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<PathBuf>,
@@ -219,6 +230,13 @@ pub struct ConvertArgs {
     pub normalize: bool,
     #[arg(long, default_value_t = -1.0)]
     pub normalize_db: f32,
+    /// Target integrated loudness in LUFS (ITU-R BS.1770-4), e.g. --loudness-target=-18.
+    /// Applied last: linear gain, then a true-peak limiter when the ceiling would be exceeded.
+    #[arg(long, allow_negative_numbers = true, conflicts_with = "normalize")]
+    pub loudness_target: Option<f64>,
+    /// True-peak ceiling in dBTP for --loudness-target (default -1.0); alone it only limits peaks.
+    #[arg(long, allow_negative_numbers = true, conflicts_with = "normalize")]
+    pub true_peak: Option<f64>,
     #[arg(long, num_args = 1..=2, value_names = ["START", "DURATION"])]
     pub trim: Vec<f32>,
     #[arg(long, num_args = 1..=2, value_names = ["IN", "OUT"])]
@@ -349,6 +367,29 @@ pub struct StreamArgs {
     pub fade_out: Option<f32>,
     #[arg(long, default_value_t = 1.0)]
     pub limiter: f32,
+    /// Target integrated loudness in LUFS, measured and applied in streaming passes.
+    #[arg(
+        long,
+        allow_negative_numbers = true,
+        conflicts_with_all = ["gain_db", "fade_in", "fade_out", "limiter"]
+    )]
+    pub loudness_target: Option<f64>,
+    /// True-peak ceiling in dBTP (default -1.0 with --loudness-target); alone it only limits peaks.
+    #[arg(
+        long,
+        allow_negative_numbers = true,
+        conflicts_with_all = ["gain_db", "fade_in", "fade_out", "limiter"]
+    )]
+    pub true_peak: Option<f64>,
+    /// Output depth: 8, 16, 24 or 32 bits (default: 16, or the input depth with loudness options).
+    #[arg(long)]
+    pub bits: Option<u16>,
+    /// Write 32-bit floating-point samples.
+    #[arg(long)]
+    pub float: bool,
+    /// Print the loudness measurements as JSON (loudness options only).
+    #[arg(long)]
+    pub stat_json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -408,6 +449,21 @@ impl LegacyCommand {
 }
 
 impl ConvertArgs {
+    /// Loudness goal requested with `--loudness-target` / `--true-peak`.
+    pub fn loudness_goal(&self) -> Result<Option<crate::limiter::LoudnessGoal>> {
+        if self.loudness_target.is_none() && self.true_peak.is_none() {
+            return Ok(None);
+        }
+        let goal = crate::limiter::LoudnessGoal {
+            target_lufs: self.loudness_target,
+            ceiling_dbtp: self
+                .true_peak
+                .unwrap_or(crate::limiter::DEFAULT_CEILING_DBTP),
+        };
+        goal.validate()?;
+        Ok(Some(goal))
+    }
+
     pub fn effect_chain(&self) -> Result<EffectChain> {
         let mut effects = Vec::new();
         if let Some(db) = self.gain_db {
@@ -523,6 +579,7 @@ fn is_subcommand(value: &str) -> bool {
     matches!(
         value,
         "info"
+            | "loudness"
             | "formats"
             | "devices"
             | "play"

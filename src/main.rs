@@ -6,6 +6,8 @@ mod effects;
 mod encode;
 mod integrations;
 mod io;
+mod limiter;
+mod loudness;
 mod mcp;
 mod mix;
 mod parse;
@@ -19,8 +21,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use audio::AudioBuffer;
 use clap::Parser;
 use cli::{
-    BatchArgs, Cli, Commands, ConcatArgs, ConvertArgs, InfoArgs, LegacyCommand, MixArgs, PlanMode,
-    ProcessingPlan, RunPlanArgs, StreamArgs, SynthArgs,
+    BatchArgs, Cli, Commands, ConcatArgs, ConvertArgs, InfoArgs, LegacyCommand, LoudnessArgs,
+    MixArgs, PlanMode, ProcessingPlan, RunPlanArgs, StreamArgs, SynthArgs,
 };
 use effects::{Effect, EffectChain};
 use parse::parse_effects;
@@ -42,6 +44,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Info(args) => run_info(args),
+        Commands::Loudness(args) => run_loudness(args),
         Commands::Formats => run_formats(),
         Commands::Devices => device::list_devices(),
         Commands::Play(args) => device::play_file(args),
@@ -94,7 +97,12 @@ fn run_formats() -> Result<()> {
     println!(
         "codec limits: MP3 mono/stereo; Vorbis 1-2 channels at 44100/48000 Hz; AAC up to 6 channels"
     );
-    println!("stream: wav -> wav for gain, fade, and limiter without loading the full file");
+    println!(
+        "stream: wav -> wav for gain, fade, limiter, and --loudness-target / --true-peak without loading the full file"
+    );
+    println!(
+        "loudness: loudness INPUT (ITU-R BS.1770-4 / EBU R128: integrated, LRA, true peak); convert --loudness-target LUFS [--true-peak dBTP]"
+    );
     println!(
         "device: devices, in-memory multi-file/repeat play, and finite/continuous WAV record use CPAL; select device, rate, and channels where supported"
     );
@@ -123,8 +131,40 @@ fn run_info(args: InfoArgs) -> Result<()> {
     Ok(())
 }
 
+/// Measure one file. WAV files are streamed with bounded memory; everything
+/// else is decoded first.
+fn measure_path(path: &std::path::Path) -> Result<loudness::LoudnessReport> {
+    let is_wav = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+    if is_wav && let Ok(report) = streaming::measure_wav(path) {
+        return Ok(report);
+    }
+    let audio =
+        AudioBuffer::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    loudness::measure(&audio.samples, audio.spec.sample_rate, audio.spec.channels)
+}
+
+fn run_loudness(args: LoudnessArgs) -> Result<()> {
+    let mut reports = Vec::with_capacity(args.inputs.len());
+    for input in &args.inputs {
+        let report = measure_path(input)
+            .with_context(|| format!("failed to measure {}", input.display()))?;
+        reports.push(loudness::FileReport::new(input, report));
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        for report in reports {
+            println!("{report}");
+        }
+    }
+    Ok(())
+}
+
 fn run_convert(args: ConvertArgs) -> Result<()> {
     let chain = args.effect_chain()?;
+    let goal = args.loudness_goal()?;
     let mut audio = AudioBuffer::read_with_raw_options(
         &args.input,
         args.input_raw_rate,
@@ -133,6 +173,22 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     )
     .with_context(|| format!("failed to read {}", args.input.display()))?;
     chain.apply(&mut audio)?;
+    let loudness_outcome = match goal {
+        Some(goal) => {
+            let outcome = limiter::normalize_buffer(
+                &mut audio.samples,
+                audio.spec.sample_rate,
+                audio.spec.channels,
+                goal,
+                args.stat_json,
+            )?;
+            if goal.target_lufs.is_some() && outcome.input.integrated_lufs.is_none() {
+                eprintln!("warning: input is silent (below the -70 LUFS gate); no gain applied");
+            }
+            Some(outcome)
+        }
+        None => None,
+    };
     encode::write_audio_with_options(
         &audio,
         &args.output,
@@ -149,7 +205,11 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     if args.stat_json || chain.wants_stats() {
         let report = stats::Report::from_audio(&args.output, &audio);
         if args.stat_json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let mut value = serde_json::to_value(&report)?;
+            if let Some(outcome) = &loudness_outcome {
+                value["loudness"] = serde_json::to_value(outcome)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             println!("{report}");
         }
