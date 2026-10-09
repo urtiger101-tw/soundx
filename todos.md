@@ -186,3 +186,13 @@
 - **main.rs 拆分** 需注意所有 `pub(crate)` 函式的引用路徑更新。
 - **Mix 行為變更** 可能影響現有使用者的混音結果，需在 changelog 標註 breaking change。
 - **Symphonia feature 調整** 需確認常用格式不受影響。
+
+---
+
+## 已完成：響度（0.3.0）
+
+- [x] `soundx loudness`：ITU-R BS.1770-4 / EBU R128（integrated、LRA、true peak、momentary／short-term）
+- [x] `convert --loudness-target/--true-peak` 與 `stream` 版本；lookahead true-peak limiter
+- [x] MCP `soundx_loudness` 工具與 Agent Skill 文件
+- [ ] 其他聲道排列（如 7.1.4、自訂 channel mask）之權重；目前依 WAV 聲道數推定
+- [ ] `batch`／`run-plan` 支援 `--loudness-target`

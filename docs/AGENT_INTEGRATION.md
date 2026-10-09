@@ -1,6 +1,6 @@
 # Agent integration and Windows audio control
 
-soundx 0.2 includes a stdio MCP server, an installable Agent Skill, and native
+soundx 0.2 and later include a stdio MCP server, an installable Agent Skill, and native
 Windows Core Audio controls in the same executable. No Node/Python runtime or
 external SoX binary is required. The existing codec and effect limits in
 [SOX_COMPATIBILITY.md](SOX_COMPATIBILITY.md) still apply.
@@ -55,7 +55,8 @@ protocol versions: 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05.
 
 | Tool | Purpose |
 | --- | --- |
-| `soundx_run` | Finite CLI commands: inspect, formats, devices, convert, concat, mix, synth, stream, batch, run-plan and help |
+| `soundx_run` | Finite CLI commands: info, loudness, formats, devices, convert, concat, mix, synth, stream, batch, run-plan and help |
+| `soundx_loudness` | Read-only ITU-R BS.1770-4 / EBU R128 loudness, loudness range and true-peak measurement (`inputs`: 1-64 paths); returns a `loudness` array |
 | `soundx_start` | Start playback/recording, returning `job_id` and `process_id` |
 | `soundx_jobs` | Inspect running/completed jobs and captured results |
 | `soundx_stop` | Gracefully stop a job belonging to this MCP connection |
@@ -64,7 +65,13 @@ protocol versions: 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05.
 | `soundx_windows_sessions` | Enumerate output audio sessions |
 | `soundx_windows_session` | Read or set one exact session's volume/mute |
 
-Example tool arguments:
+Example tool arguments for `soundx_loudness`:
+
+```json
+{"inputs":["C:/audio/input.wav"]}
+```
+
+and for `soundx_run`:
 
 ```json
 {"arguments":["convert","C:/audio/input.wav","C:/audio/output.flac"]}

@@ -13,6 +13,19 @@ SoX-style tool with a documented subset of SoX compatibility.
 
 - Inspect inputs with `soundx info INPUT --json` before choosing sample rate,
   channels, format or normalization.
+- Measure loudness with `soundx loudness INPUT... --json` (ITU-R BS.1770-4 / EBU R128:
+  `integrated_lufs`, `loudness_range_lu`, `true_peak_dbtp`, `sample_peak_dbfs`,
+  momentary/short-term maxima). `integrated_lufs` is `null` for silence. WAV files are
+  streamed with bounded memory. `soundx loudness --help` succeeding means the
+  installed build supports it (absent before 0.3).
+- Normalise loudness with `soundx convert IN OUT --loudness-target=-18 --true-peak=-1.8
+  --stat-json` (mutually exclusive with `--normalize`; write negative values as
+  `--opt=-18`). It measures, applies linear gain, and uses a lookahead true-peak limiter
+  only when needed (never hard clipping; same frame count, no added delay). The JSON adds
+  `loudness.{input,output,gain_db,limited,limiter_gain_reduction_max_db}`. `--true-peak`
+  alone only limits peaks. For very long WAV files use `soundx stream IN.wav OUT.wav
+  --loudness-target=... --true-peak=...` (bounded memory; keeps the input bit depth unless
+  `--bits`/`--float` is given). Verify with `soundx loudness OUT --json`.
 - Use `soundx convert INPUT OUTPUT --help`, `soundx synth --help`, or
   `soundx run-plan --help` for the exact installed options.
 - For ordered effects including dither, compand, reverb, tempo and stretch, use
@@ -35,6 +48,10 @@ The installer can register it for Codex, Claude Code, OpenCode and AGY.
   `{"arguments":["convert","C:/audio/in.wav","C:/audio/out.flac"]}`.
   Read `state`, `exit_code`, `stderr` and `output_json`; `failed` or `timed_out`
   means the requested operation did not complete successfully.
+- `soundx_loudness`: read-only BS.1770-4 / EBU R128 measurement. Arguments:
+  `{"inputs":["C:/audio/a.wav"],"timeout_seconds":120}`; the result's `loudness` array has one
+  object per input (same fields as `soundx loudness --json`). `soundx_run` also accepts
+  `loudness` and `convert ... --loudness-target=-18 --true-peak=-1.8`.
 - `soundx_start`: start `play` or `record`; retain the returned `job_id`.
 - `soundx_jobs`: inspect job results. `started`/`running` does not mean completed.
 - `soundx_stop`: stop by that MCP session's job id. Continuous WAV recording

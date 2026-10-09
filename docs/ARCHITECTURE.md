@@ -35,7 +35,9 @@ src/
 ├── parse.rs       Effect token parser
 ├── io.rs          File I/O utilities
 ├── mix.rs         Concat and mix
-├── streaming.rs   Incremental WAV pipeline
+├── streaming.rs   Incremental WAV pipeline and streaming loudness normalisation
+├── loudness.rs    ITU-R BS.1770-4 / EBU R128 meter (K-weighting, gating, LRA, true peak)
+├── limiter.rs     Lookahead true-peak limiter and loudness normalisation flow
 ├── synth.rs       Waveform generation
 ├── stats.rs       Audio statistics (peak, RMS, clipping)
 └── util.rs        Shared utility functions

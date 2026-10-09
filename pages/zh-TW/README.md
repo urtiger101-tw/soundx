@@ -65,6 +65,11 @@ soundx synth tone.wav --duration 2 --freq 440 --waveform sine --fade 0.05
 # 串流處理（低記憶體，適合大型檔案）
 soundx stream huge.wav processed.wav --gain-db=-3 --fade-in 0.5 --fade-out 0.5
 
+# 響度量測（BS.1770-4 / EBU R128）與正規化至 -18 LUFS、true peak ≤ -1.8 dBTP
+soundx loudness track.wav --json
+soundx convert in.wav out.wav --loudness-target=-18 --true-peak=-1.8
+soundx stream huge.wav out.wav --loudness-target=-18 --true-peak=-1.8
+
 # 列出支援的編解碼器
 soundx formats
 

@@ -16,7 +16,8 @@ not claim command-for-command or sample-for-sample parity.
 
 Still unsupported are effects including `band`, `bend`, `biquad`, `chorus`,
 `contrast`, `deemph`, `divide`, `earwax`, `echos`, `fir`, `flanger`,
-`hilbert`, `ladspa`, `loudness`, `mcompand`, `noiseprof`, `noisered`, `oops`,
+`hilbert`, `ladspa`, `loudness` (the SoX equal-loudness effect; the soundx
+`loudness` subcommand measures EBU R128 instead), `mcompand`, `noiseprof`, `noisered`, `oops`,
 `overdrive`, `phaser`, `pitch`, `remix`, `riaa`, `sinc`, `spectrogram`,
 `splice`, and `vad`.
 

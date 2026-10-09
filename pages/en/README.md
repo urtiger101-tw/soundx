@@ -67,6 +67,11 @@ soundx synth tone.wav --duration 2 --freq 440 --waveform sine --fade 0.05
 # Streaming (low-memory large file processing)
 soundx stream huge.wav processed.wav --gain-db=-3 --fade-in 0.5 --fade-out 0.5
 
+# Loudness (ITU-R BS.1770-4 / EBU R128): measure, then normalise to -18 LUFS with a -1.8 dBTP ceiling
+soundx loudness track.wav --json
+soundx convert in.wav out.wav --loudness-target=-18 --true-peak=-1.8
+soundx stream huge.wav out.wav --loudness-target=-18 --true-peak=-1.8
+
 # List supported codecs
 soundx formats
 
