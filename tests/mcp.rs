@@ -97,7 +97,7 @@ fn mcp_stdio_processes_real_audio_and_reports_failures() {
             .as_array()
             .unwrap()
             .len(),
-        8
+        9
     );
     let result = client.tool("soundx_run", json!({"arguments":["synth",input,"--duration","0.05","--waveform","silence","--stat-json"]}));
     assert_eq!(result["isError"], false, "{result}");

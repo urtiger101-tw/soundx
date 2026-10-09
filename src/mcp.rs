@@ -27,6 +27,14 @@ fn default_timeout() -> u64 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LoudnessArgs {
+    inputs: Vec<String>,
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartArgs {
     arguments: Vec<String>,
 }
@@ -272,6 +280,28 @@ impl Server {
             next_job: 1,
         })
     }
+    /// Run a finite command to completion (or kill it at the timeout).
+    fn run_finite(&mut self, arguments: Vec<String>, timeout_seconds: u64) -> Result<Value> {
+        if !(1..=600).contains(&timeout_seconds) {
+            bail!("timeout_seconds must be between 1 and 600");
+        }
+        let mut job = Job::spawn(arguments, self.directory.join("run.stop"))?;
+        let started = Instant::now();
+        loop {
+            let result = job.poll()?;
+            if result["state"] != "running" {
+                return Ok(result);
+            }
+            if started.elapsed() >= Duration::from_secs(timeout_seconds) {
+                job.child.kill()?;
+                job.child.wait()?;
+                let mut result = job.poll()?;
+                result["state"] = json!("timed_out");
+                return Ok(result);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     fn call(&mut self, name: &str, arguments: Value) -> Result<Value> {
         match name {
             "soundx_run" => {
@@ -280,6 +310,7 @@ impl Server {
                 if !matches!(
                     args.arguments[0].as_str(),
                     "info"
+                        | "loudness"
                         | "formats"
                         | "devices"
                         | "convert"
@@ -297,25 +328,21 @@ impl Server {
                         "command is not supported by soundx_run; use soundx_start for play/record and Windows tools for volume control"
                     );
                 }
-                if !(1..=600).contains(&args.timeout_seconds) {
-                    bail!("timeout_seconds must be between 1 and 600");
+                self.run_finite(args.arguments, args.timeout_seconds)
+            }
+            "soundx_loudness" => {
+                let args: LoudnessArgs = serde_json::from_value(arguments)?;
+                if args.inputs.is_empty() || args.inputs.len() > 64 {
+                    bail!("inputs must contain 1 to 64 paths");
                 }
-                let mut job = Job::spawn(args.arguments, self.directory.join("run.stop"))?;
-                let started = Instant::now();
-                loop {
-                    let result = job.poll()?;
-                    if result["state"] != "running" {
-                        return Ok(result);
-                    }
-                    if started.elapsed() >= Duration::from_secs(args.timeout_seconds) {
-                        job.child.kill()?;
-                        job.child.wait()?;
-                        let mut result = job.poll()?;
-                        result["state"] = json!("timed_out");
-                        return Ok(result);
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
+                let mut arguments = vec!["loudness".to_string()];
+                // `--` keeps file names that start with a dash from being flags.
+                arguments.push("--json".into());
+                arguments.push("--".into());
+                arguments.extend(args.inputs);
+                let mut result = self.run_finite(arguments, args.timeout_seconds)?;
+                result["loudness"] = result["output_json"].clone();
+                Ok(result)
             }
             "soundx_start" => {
                 let args: StartArgs = serde_json::from_value(arguments)?;
@@ -522,7 +549,8 @@ fn tools() -> Vec<Value> {
     let volume = json!({"type":"number","minimum":0,"maximum":100});
     let mute = json!({"type":"boolean"});
     [
-        ("soundx_run", "Run finite soundx CLI processing with separate arguments, no shell. Commands: info, formats, devices, convert, concat, mix, synth, stream, batch, run-plan, help, --help, --version. Use help for flags. May create/overwrite output files. Returns exit status and captured output.", schema(json!({"arguments":arguments,"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}), &["arguments"]), false),
+        ("soundx_run", "Run finite soundx CLI processing with separate arguments, no shell. Commands: info, loudness, formats, devices, convert, concat, mix, synth, stream, batch, run-plan, help, --help, --version. Use help for flags. May create/overwrite output files. Returns exit status and captured output.", schema(json!({"arguments":arguments,"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}), &["arguments"]), false),
+        ("soundx_loudness", "Measure ITU-R BS.1770-4 / EBU R128 loudness of audio files: integrated LUFS, loudness range (LRA), true peak (dBTP), sample peak, momentary and short-term maxima. Read-only. Returns `loudness`, an array with one object per input (integrated_lufs is null for silence).", schema(json!({"inputs":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,"description":"Absolute audio file paths"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}), &["inputs"]), true),
         ("soundx_start", "Start play or record as a managed job. Includes looping playback and continuous WAV capture. Returns a job id, not completion. Jobs end when this MCP connection closes. Use soundx_stop to finalize recording.", schema(json!({"arguments":arguments}), &["arguments"]), false),
         ("soundx_jobs", "Read states and captured results of this connection's jobs. At most 32 jobs are retained.", schema(json!({}), &[]), true),
         ("soundx_stop", "Gracefully stop a managed play/record job and return its final status. Never accepts arbitrary process ids.", schema(json!({"job_id":{"type":"integer","minimum":1}}), &["job_id"]), false),
@@ -595,7 +623,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            8
+            9
         );
         assert_eq!(server.dispatch(json!([])).unwrap()["error"]["code"], -32600);
         assert_eq!(
