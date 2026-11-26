@@ -816,7 +816,7 @@ mod tests {
         let target = repo.join("claude.json");
         std::fs::write(&target, "{\"theme\":\"dark\"}").unwrap();
         // Relative link target, as dotfile managers commonly create.
-        if !try_symlink(Path::new("dotfiles/claude.json"), &layout.config) {
+        if !try_symlink(&Path::new("dotfiles").join("claude.json"), &layout.config) {
             std::fs::remove_dir_all(home).unwrap();
             return;
         }
@@ -844,7 +844,7 @@ mod tests {
         let home = root();
         let target = home.join("dotfiles/new.json");
         let link = home.join("link.json");
-        if !try_symlink(Path::new("dotfiles/new.json"), &link) {
+        if !try_symlink(&Path::new("dotfiles").join("new.json"), &link) {
             std::fs::remove_dir_all(home).unwrap();
             return;
         }
