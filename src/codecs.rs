@@ -197,11 +197,14 @@ fn decode_wavpack(bytes: &[u8]) -> Result<AudioBuffer> {
     }
 
     let samples = if decoded.is_float {
-        decoded
+        // Float WavPack keeps values above full scale; only NaN/Inf is rejected.
+        let samples: Vec<f32> = decoded
             .samples
             .into_iter()
             .map(|bits| f32::from_bits(bits as u32))
-            .collect()
+            .collect();
+        crate::audio::ensure_finite_samples(&samples, "WavPack float stream")?;
+        samples
     } else {
         if !(8..=32).contains(&decoded.bits_per_sample) {
             bail!(
@@ -367,17 +370,9 @@ fn normalized_to_i16(sample: f32) -> Result<i16> {
 }
 
 fn validate_audio(audio: &AudioBuffer) -> Result<()> {
-    if audio.spec.sample_rate == 0 || audio.spec.channels == 0 {
-        bail!("audio sample rate and channel count must be greater than zero");
-    }
-    if !audio
-        .samples
-        .len()
-        .is_multiple_of(usize::from(audio.spec.channels))
-    {
-        bail!("audio sample count is not aligned to its channel count");
-    }
-    Ok(())
+    // Rejects NaN/infinite samples too, so the float WavPack writer cannot
+    // store them; the integer GSM/AMR/ADPCM paths clamp in `normalized_to_i16`.
+    audio.validate()
 }
 
 #[cfg(test)]

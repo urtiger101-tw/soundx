@@ -3,7 +3,8 @@ use crate::parse::parse_effects;
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -14,7 +15,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Print WAV metadata and level statistics.
+    /// Print audio file metadata and level statistics.
     Info(InfoArgs),
     /// Measure ITU-R BS.1770-4 / EBU R128 loudness, loudness range and true peak.
     Loudness(LoudnessArgs),
@@ -28,9 +29,9 @@ pub enum Commands {
     Record(RecordArgs),
     /// Convert one input file into one output file.
     Convert(ConvertArgs),
-    /// Concatenate WAV files in order.
+    /// Concatenate audio files in order.
     Concat(ConcatArgs),
-    /// Mix WAV files into one output.
+    /// Mix audio files into one output.
     Mix(MixArgs),
     /// Generate audio from built-in waveforms.
     Synth(SynthArgs),
@@ -174,7 +175,7 @@ pub struct PlayArgs {
 pub struct RecordArgs {
     pub output: PathBuf,
     /// Recording duration in seconds (ignored with --continuous).
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 5.0, value_parser = finite_f64)]
     pub duration: f64,
     /// Record until Ctrl+C and stream a 16-bit PCM WAV to disk.
     #[arg(long)]
@@ -224,36 +225,36 @@ pub struct ConvertArgs {
     /// AU/SND encoding. Defaults to 16-bit PCM.
     #[arg(long, value_enum)]
     pub au_encoding: Option<crate::encode::AuEncoding>,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true, value_parser = finite_f32)]
     pub gain_db: Option<f32>,
     #[arg(long)]
     pub normalize: bool,
-    #[arg(long, default_value_t = -1.0)]
+    #[arg(long, default_value_t = -1.0, allow_negative_numbers = true, requires = "normalize", value_parser = finite_f32)]
     pub normalize_db: f32,
     /// Target integrated loudness in LUFS (ITU-R BS.1770-4), e.g. --loudness-target=-18.
     /// Applied last: linear gain, then a true-peak limiter when the ceiling would be exceeded.
-    #[arg(long, allow_negative_numbers = true, conflicts_with = "normalize")]
+    #[arg(long, allow_negative_numbers = true, value_parser = finite_f64, conflicts_with = "normalize")]
     pub loudness_target: Option<f64>,
     /// True-peak ceiling in dBTP for --loudness-target (default -1.0); alone it only limits peaks.
-    #[arg(long, allow_negative_numbers = true, conflicts_with = "normalize")]
+    #[arg(long, allow_negative_numbers = true, value_parser = finite_f64, conflicts_with = "normalize")]
     pub true_peak: Option<f64>,
-    #[arg(long, num_args = 1..=2, value_names = ["START", "DURATION"])]
+    #[arg(long, num_args = 1..=2, allow_negative_numbers = true, value_names = ["START", "DURATION"], value_parser = finite_f32)]
     pub trim: Vec<f32>,
-    #[arg(long, num_args = 1..=2, value_names = ["IN", "OUT"])]
+    #[arg(long, num_args = 1..=2, allow_negative_numbers = true, value_names = ["IN", "OUT"], value_parser = finite_f32)]
     pub fade: Vec<f32>,
     #[arg(long)]
     pub reverse: bool,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub speed: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub lowpass: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub highpass: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub limiter: Option<f32>,
-    #[arg(long, num_args = 1..=2, value_names = ["START", "END"])]
+    #[arg(long, num_args = 1..=2, allow_negative_numbers = true, value_names = ["START", "END"], value_parser = finite_f32)]
     pub pad: Vec<f32>,
-    #[arg(long, num_args = 1..=2, value_names = ["THRESHOLD_DB", "MIN_SECONDS"])]
+    #[arg(long, num_args = 1..=2, allow_negative_numbers = true, value_names = ["THRESHOLD_DB", "MIN_SECONDS"], value_parser = finite_f32)]
     pub silence: Vec<f32>,
     #[arg(long)]
     pub rate: Option<u32>,
@@ -271,23 +272,23 @@ pub struct BatchArgs {
     pub out_dir: PathBuf,
     #[arg(long, default_value = "wav")]
     pub ext: String,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true, value_parser = finite_f32)]
     pub gain_db: Option<f32>,
     #[arg(long)]
     pub normalize: bool,
-    #[arg(long, default_value_t = -1.0)]
+    #[arg(long, default_value_t = -1.0, allow_negative_numbers = true, requires = "normalize", value_parser = finite_f32)]
     pub normalize_db: f32,
     #[arg(long)]
     pub rate: Option<u32>,
     #[arg(long)]
     pub channels: Option<u16>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub speed: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub lowpass: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub highpass: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub limiter: Option<f32>,
     #[arg(long)]
     pub stat_json: bool,
@@ -333,23 +334,23 @@ pub struct RunPlanArgs {
 #[derive(Debug, Args)]
 pub struct SynthArgs {
     pub output: PathBuf,
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = finite_f32)]
     pub duration: f32,
-    #[arg(long, default_value_t = 440.0)]
+    #[arg(long, default_value_t = 440.0, value_parser = finite_f32)]
     pub freq: f32,
     #[arg(long, default_value_t = 44_100)]
     pub rate: u32,
     #[arg(long, default_value_t = 1)]
     pub channels: u16,
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = finite_f32)]
     pub amplitude: f32,
     #[arg(long, value_enum, default_value_t = Waveform::Sine)]
     pub waveform: Waveform,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true, value_parser = finite_f32)]
     pub gain_db: Option<f32>,
     #[arg(long)]
     pub normalize: bool,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub fade: Option<f32>,
     #[arg(long)]
     pub stat_json: bool,
@@ -359,18 +360,19 @@ pub struct SynthArgs {
 pub struct StreamArgs {
     pub input: PathBuf,
     pub output: PathBuf,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true, value_parser = finite_f32)]
     pub gain_db: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub fade_in: Option<f32>,
-    #[arg(long)]
+    #[arg(long, value_parser = finite_f32)]
     pub fade_out: Option<f32>,
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = finite_f32)]
     pub limiter: f32,
     /// Target integrated loudness in LUFS, measured and applied in streaming passes.
     #[arg(
         long,
         allow_negative_numbers = true,
+        value_parser = finite_f64,
         conflicts_with_all = ["gain_db", "fade_in", "fade_out", "limiter"]
     )]
     pub loudness_target: Option<f64>,
@@ -378,13 +380,14 @@ pub struct StreamArgs {
     #[arg(
         long,
         allow_negative_numbers = true,
+        value_parser = finite_f64,
         conflicts_with_all = ["gain_db", "fade_in", "fade_out", "limiter"]
     )]
     pub true_peak: Option<f64>,
-    /// Output depth: 8, 16, 24 or 32 bits (default: 16, or the input depth with loudness options).
+    /// Output depth: 8, 16, 24 or 32 bits (default: the input depth and sample format).
     #[arg(long)]
     pub bits: Option<u16>,
-    /// Write 32-bit floating-point samples.
+    /// Write 32-bit floating-point samples (default: float only for float input).
     #[arg(long)]
     pub float: bool,
     /// Print the loudness measurements as JSON (loudness options only).
@@ -403,6 +406,7 @@ pub enum Waveform {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessingPlan {
     #[serde(default)]
     pub mode: PlanMode,
@@ -427,8 +431,22 @@ pub enum PlanMode {
 
 impl LegacyCommand {
     pub fn from_env() -> Result<Option<Self>> {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.is_empty() || is_subcommand(&args[0]) || args[0].starts_with('-') {
+        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+        Self::from_args(&args)
+    }
+
+    fn from_args(args: &[OsString]) -> Result<Option<Self>> {
+        let Some(first) = args.first() else {
+            return Ok(None);
+        };
+        if let Some(text) = first.to_str()
+            && (is_subcommand(text) || text.starts_with('-'))
+        {
+            return Ok(None);
+        }
+        // Only treat the first argument as an input file when it plausibly
+        // names one; otherwise let clap report an unrecognized subcommand.
+        if !looks_like_input_path(first) {
             return Ok(None);
         }
 
@@ -436,15 +454,131 @@ impl LegacyCommand {
             bail!("SoX-style usage requires <input> <output> [effect ...]");
         }
 
-        let input = PathBuf::from(&args[0]);
+        let input = PathBuf::from(first);
         let output = PathBuf::from(&args[1]);
-        let (effects, stat_json) = parse_effects(&args[2..])?;
+        let tokens = args[2..]
+            .iter()
+            .map(|arg| {
+                arg.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("effect arguments must be valid UTF-8"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (effects, stat_json) = parse_effects(&tokens)?;
         Ok(Some(Self {
             input,
             output,
             effects,
             stat_json,
         }))
+    }
+}
+
+fn looks_like_input_path(value: &OsStr) -> bool {
+    let path = Path::new(value);
+    path.exists() || path.extension().is_some() || value.to_string_lossy().contains(['/', '\\'])
+}
+
+/// Clap value parser: a float that is neither NaN nor infinite.
+pub fn finite_f32(value: &str) -> std::result::Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|err| format!("invalid number '{value}': {err}"))?;
+    if parsed.is_finite() {
+        Ok(parsed)
+    } else {
+        Err(format!("'{value}' is not a finite number"))
+    }
+}
+
+/// Clap value parser: a double that is neither NaN nor infinite.
+pub fn finite_f64(value: &str) -> std::result::Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|err| format!("invalid number '{value}': {err}"))?;
+    if parsed.is_finite() {
+        Ok(parsed)
+    } else {
+        Err(format!("'{value}' is not a finite number"))
+    }
+}
+
+/// Every effect option shared by `convert`, `batch` and `synth`, built into a
+/// chain in one fixed order: gain, normalize, trim, fade, reverse, speed,
+/// lowpass, highpass, limiter, pad, silence, rate, channels.
+#[derive(Default)]
+struct EffectOptions<'a> {
+    gain_db: Option<f32>,
+    normalize: Option<f32>,
+    trim: &'a [f32],
+    fade: &'a [f32],
+    reverse: bool,
+    speed: Option<f32>,
+    lowpass: Option<f32>,
+    highpass: Option<f32>,
+    limiter: Option<f32>,
+    pad: &'a [f32],
+    silence: &'a [f32],
+    rate: Option<u32>,
+    channels: Option<u16>,
+}
+
+impl EffectOptions<'_> {
+    fn build(&self) -> EffectChain {
+        use crate::effects::Effect;
+        let mut effects = Vec::new();
+        if let Some(db) = self.gain_db {
+            effects.push(Effect::GainDb(db));
+        }
+        if let Some(target_db) = self.normalize {
+            effects.push(Effect::Normalize { target_db });
+        }
+        if let Some(&start_sec) = self.trim.first() {
+            effects.push(Effect::Trim {
+                start_sec,
+                duration_sec: self.trim.get(1).copied(),
+            });
+        }
+        if let Some(&in_sec) = self.fade.first() {
+            effects.push(Effect::Fade {
+                in_sec,
+                out_sec: self.fade.get(1).copied().unwrap_or(0.0),
+            });
+        }
+        if self.reverse {
+            effects.push(Effect::Reverse);
+        }
+        if let Some(factor) = self.speed {
+            effects.push(Effect::Speed { factor });
+        }
+        if let Some(hz) = self.lowpass {
+            effects.push(Effect::LowPass { hz });
+        }
+        if let Some(hz) = self.highpass {
+            effects.push(Effect::HighPass { hz });
+        }
+        if let Some(threshold) = self.limiter {
+            effects.push(Effect::Limiter { threshold });
+        }
+        if let Some(&start_sec) = self.pad.first() {
+            effects.push(Effect::Pad {
+                start_sec,
+                end_sec: self.pad.get(1).copied().unwrap_or(0.0),
+            });
+        }
+        if let Some(&threshold_db) = self.silence.first() {
+            effects.push(Effect::Silence {
+                threshold_db,
+                min_duration_sec: self.silence.get(1).copied().unwrap_or(0.1),
+            });
+        }
+        if let Some(sample_rate) = self.rate {
+            effects.push(Effect::Rate { sample_rate });
+        }
+        if let Some(channels) = self.channels {
+            effects.push(Effect::Channels { channels });
+        }
+        EffectChain::new(effects)
     }
 }
 
@@ -465,113 +599,53 @@ impl ConvertArgs {
     }
 
     pub fn effect_chain(&self) -> Result<EffectChain> {
-        let mut effects = Vec::new();
-        if let Some(db) = self.gain_db {
-            effects.push(crate::effects::Effect::GainDb(db));
+        Ok(EffectOptions {
+            gain_db: self.gain_db,
+            normalize: self.normalize.then_some(self.normalize_db),
+            trim: &self.trim,
+            fade: &self.fade,
+            reverse: self.reverse,
+            speed: self.speed,
+            lowpass: self.lowpass,
+            highpass: self.highpass,
+            limiter: self.limiter,
+            pad: &self.pad,
+            silence: &self.silence,
+            rate: self.rate,
+            channels: self.channels,
         }
-        if self.normalize {
-            effects.push(crate::effects::Effect::Normalize {
-                target_db: self.normalize_db,
-            });
-        }
-        if !self.trim.is_empty() {
-            effects.push(crate::effects::Effect::Trim {
-                start_sec: self.trim[0],
-                duration_sec: self.trim.get(1).copied(),
-            });
-        }
-        if !self.fade.is_empty() {
-            effects.push(crate::effects::Effect::Fade {
-                in_sec: self.fade[0],
-                out_sec: self.fade.get(1).copied().unwrap_or(0.0),
-            });
-        }
-        if self.reverse {
-            effects.push(crate::effects::Effect::Reverse);
-        }
-        if let Some(factor) = self.speed {
-            effects.push(crate::effects::Effect::Speed { factor });
-        }
-        if let Some(hz) = self.lowpass {
-            effects.push(crate::effects::Effect::LowPass { hz });
-        }
-        if let Some(hz) = self.highpass {
-            effects.push(crate::effects::Effect::HighPass { hz });
-        }
-        if let Some(threshold) = self.limiter {
-            effects.push(crate::effects::Effect::Limiter { threshold });
-        }
-        if !self.pad.is_empty() {
-            effects.push(crate::effects::Effect::Pad {
-                start_sec: self.pad[0],
-                end_sec: self.pad.get(1).copied().unwrap_or(0.0),
-            });
-        }
-        if !self.silence.is_empty() {
-            effects.push(crate::effects::Effect::Silence {
-                threshold_db: self.silence[0],
-                min_duration_sec: self.silence.get(1).copied().unwrap_or(0.1),
-            });
-        }
-        if let Some(sample_rate) = self.rate {
-            effects.push(crate::effects::Effect::Rate { sample_rate });
-        }
-        if let Some(channels) = self.channels {
-            effects.push(crate::effects::Effect::Channels { channels });
-        }
-        Ok(EffectChain::new(effects))
+        .build())
     }
 }
 
 impl BatchArgs {
+    /// Same effect order as `convert`.
     pub fn effect_chain(&self) -> Result<EffectChain> {
-        let mut effects = Vec::new();
-        if let Some(db) = self.gain_db {
-            effects.push(crate::effects::Effect::GainDb(db));
+        Ok(EffectOptions {
+            gain_db: self.gain_db,
+            normalize: self.normalize.then_some(self.normalize_db),
+            speed: self.speed,
+            lowpass: self.lowpass,
+            highpass: self.highpass,
+            limiter: self.limiter,
+            rate: self.rate,
+            channels: self.channels,
+            ..EffectOptions::default()
         }
-        if self.normalize {
-            effects.push(crate::effects::Effect::Normalize {
-                target_db: self.normalize_db,
-            });
-        }
-        if let Some(sample_rate) = self.rate {
-            effects.push(crate::effects::Effect::Rate { sample_rate });
-        }
-        if let Some(channels) = self.channels {
-            effects.push(crate::effects::Effect::Channels { channels });
-        }
-        if let Some(factor) = self.speed {
-            effects.push(crate::effects::Effect::Speed { factor });
-        }
-        if let Some(hz) = self.lowpass {
-            effects.push(crate::effects::Effect::LowPass { hz });
-        }
-        if let Some(hz) = self.highpass {
-            effects.push(crate::effects::Effect::HighPass { hz });
-        }
-        if let Some(threshold) = self.limiter {
-            effects.push(crate::effects::Effect::Limiter { threshold });
-        }
-        Ok(EffectChain::new(effects))
+        .build())
     }
 }
 
 impl SynthArgs {
     pub fn effect_chain(&self) -> Result<EffectChain> {
-        let mut effects = Vec::new();
-        if let Some(db) = self.gain_db {
-            effects.push(crate::effects::Effect::GainDb(db));
+        let fade = self.fade.map(|duration| [duration, duration]);
+        Ok(EffectOptions {
+            gain_db: self.gain_db,
+            normalize: self.normalize.then_some(-1.0),
+            fade: fade.as_ref().map_or(&[][..], |pair| pair.as_slice()),
+            ..EffectOptions::default()
         }
-        if self.normalize {
-            effects.push(crate::effects::Effect::Normalize { target_db: -1.0 });
-        }
-        if let Some(duration) = self.fade {
-            effects.push(crate::effects::Effect::Fade {
-                in_sec: duration,
-                out_sec: duration,
-            });
-        }
-        Ok(EffectChain::new(effects))
+        .build())
     }
 }
 

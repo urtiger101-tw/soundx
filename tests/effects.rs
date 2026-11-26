@@ -1352,7 +1352,529 @@ fn test_single_frame_behaviors() -> Result<()> {
         Effect::Rate { sample_rate: 200 },
     ])
     .apply(&mut buf)?;
-    assert_eq!(buf.frames(), 1);
+    // speed 2: round(1 / 2) = 1 frame (never fewer than one for non-empty
+    // input); rate 100 -> 200: round(1 * 2) = 2 frames.
+    assert_eq!(buf.frames(), 2);
     assert_eq!(buf.spec.sample_rate, 200);
+    assert!(buf.samples.iter().all(|sample| sample.is_finite()));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Parameter validation (NaN / infinity / out of domain)
+// ---------------------------------------------------------------------------
+
+fn apply_one(effect: Effect) -> Result<AudioBuffer> {
+    let mut buf = constant_buffer(100, 1, 100, 0.5);
+    EffectChain::new(vec![effect]).apply(&mut buf)?;
+    Ok(buf)
+}
+
+#[test]
+fn test_effects_reject_non_finite_parameters() {
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    let cases: Vec<(&str, Effect)> = vec![
+        ("gain nan", Effect::GainDb(nan)),
+        ("gain inf", Effect::GainDb(inf)),
+        ("gain -inf", Effect::GainDb(-inf)),
+        ("gain overflow", Effect::GainDb(1.0e4)),
+        ("normalize nan", Effect::Normalize { target_db: nan }),
+        ("normalize inf", Effect::Normalize { target_db: inf }),
+        (
+            "trim start nan",
+            Effect::Trim {
+                start_sec: nan,
+                duration_sec: None,
+            },
+        ),
+        (
+            "trim start inf",
+            Effect::Trim {
+                start_sec: inf,
+                duration_sec: None,
+            },
+        ),
+        (
+            "trim duration nan",
+            Effect::Trim {
+                start_sec: 0.0,
+                duration_sec: Some(nan),
+            },
+        ),
+        (
+            "trim duration negative",
+            Effect::Trim {
+                start_sec: 0.0,
+                duration_sec: Some(-1.0),
+            },
+        ),
+        (
+            "fade in nan",
+            Effect::Fade {
+                in_sec: nan,
+                out_sec: 0.0,
+            },
+        ),
+        (
+            "fade out nan",
+            Effect::Fade {
+                in_sec: 0.0,
+                out_sec: nan,
+            },
+        ),
+        (
+            "pad start nan",
+            Effect::Pad {
+                start_sec: nan,
+                end_sec: 0.0,
+            },
+        ),
+        (
+            "pad end inf",
+            Effect::Pad {
+                start_sec: 0.0,
+                end_sec: inf,
+            },
+        ),
+        ("speed nan", Effect::Speed { factor: nan }),
+        ("speed inf", Effect::Speed { factor: inf }),
+        ("lowpass nan", Effect::LowPass { hz: nan }),
+        ("lowpass inf", Effect::LowPass { hz: inf }),
+        ("highpass nan", Effect::HighPass { hz: nan }),
+        ("highpass inf", Effect::HighPass { hz: inf }),
+        ("limiter nan", Effect::Limiter { threshold: nan }),
+        (
+            "silence min duration nan",
+            Effect::Silence {
+                threshold_db: -60.0,
+                min_duration_sec: nan,
+            },
+        ),
+        (
+            "silence threshold nan",
+            Effect::Silence {
+                threshold_db: nan,
+                min_duration_sec: 0.1,
+            },
+        ),
+    ];
+    for (name, effect) in cases {
+        assert!(apply_one(effect).is_err(), "{name} was accepted");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Overflow / huge allocations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_trim_with_huge_duration_behaves_like_open_ended_trim() -> Result<()> {
+    let make = || AudioBuffer {
+        spec: AudioSpec {
+            sample_rate: 10,
+            channels: 1,
+        },
+        samples: (0..10).map(|i| i as f32).collect(),
+    };
+    for duration in [1.0e30, f32::MAX] {
+        let mut huge = make();
+        EffectChain::new(vec![Effect::Trim {
+            start_sec: 0.2,
+            duration_sec: Some(duration),
+        }])
+        .apply(&mut huge)?;
+        let mut open = make();
+        EffectChain::new(vec![Effect::Trim {
+            start_sec: 0.2,
+            duration_sec: None,
+        }])
+        .apply(&mut open)?;
+        assert_eq!(huge.samples, open.samples, "duration {duration}");
+        assert_eq!(huge.samples, (2..10).map(|i| i as f32).collect::<Vec<_>>());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_pad_with_huge_duration_is_a_readable_error() {
+    for (start_sec, end_sec) in [(1.0e30, 0.0), (0.0, 1.0e30), (f32::MAX, f32::MAX)] {
+        for channels in [1, 2] {
+            let mut buf = constant_buffer(4, channels, 44_100, 0.5);
+            let error = EffectChain::new(vec![Effect::Pad { start_sec, end_sec }])
+                .apply(&mut buf)
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("too large") || message.contains("not enough memory"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_speed_with_tiny_factor_is_a_readable_error() {
+    let mut buf = constant_buffer(100, 2, 44_100, 0.5);
+    let error = EffectChain::new(vec![Effect::Speed { factor: 1.0e-30 }])
+        .apply(&mut buf)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("too large"), "{error:#}");
+}
+
+// ---------------------------------------------------------------------------
+// Channel downmix (ITU-R BS.775)
+// ---------------------------------------------------------------------------
+
+const MINUS_3DB: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+fn one_frame(frame: &[f32]) -> AudioBuffer {
+    AudioBuffer {
+        spec: AudioSpec {
+            sample_rate: 48_000,
+            channels: frame.len() as u16,
+        },
+        samples: frame.to_vec(),
+    }
+}
+
+fn convert(frame: &[f32], channels: u16) -> Result<Vec<f32>> {
+    let mut buf = one_frame(frame);
+    EffectChain::new(vec![Effect::Channels { channels }]).apply(&mut buf)?;
+    assert_eq!(buf.spec.channels, channels);
+    Ok(buf.samples)
+}
+
+#[test]
+fn test_5_1_centre_only_downmixes_to_both_stereo_channels() -> Result<()> {
+    // L R C LFE Ls Rs
+    let stereo = convert(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 2)?;
+    assert_buffer_eq(&stereo, &[MINUS_3DB, MINUS_3DB], 1e-6, "5.1 centre");
+    let mono = convert(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 1)?;
+    assert_buffer_eq(&mono, &[MINUS_3DB], 1e-6, "5.1 centre mono");
+    Ok(())
+}
+
+#[test]
+fn test_5_1_downmix_uses_bs775_coefficients_and_drops_lfe() -> Result<()> {
+    assert_buffer_eq(
+        &convert(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2)?,
+        &[1.0, 0.0],
+        1e-6,
+        "left",
+    );
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0], 2)?,
+        &[0.0, 0.0],
+        1e-6,
+        "lfe",
+    );
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 2)?,
+        &[MINUS_3DB, 0.0],
+        1e-6,
+        "left surround",
+    );
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 2)?,
+        &[0.0, MINUS_3DB],
+        1e-6,
+        "right surround",
+    );
+    // Mono is the average of the stereo downmix.
+    assert_buffer_eq(
+        &convert(&[0.2, 0.4, 0.5, 0.9, 0.3, 0.1], 1)?,
+        &[(0.2 + 0.4 + 2.0 * MINUS_3DB * 0.5 + MINUS_3DB * (0.3 + 0.1)) / 2.0],
+        1e-6,
+        "5.1 mono",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_quad_5_0_and_7_1_downmix_to_stereo() -> Result<()> {
+    // quad: L R Ls Rs
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 1.0, 0.5], 2)?,
+        &[MINUS_3DB, 0.5 * MINUS_3DB],
+        1e-6,
+        "quad",
+    );
+    // 5.0: L R C Ls Rs
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 1.0, 0.0, 0.0], 2)?,
+        &[MINUS_3DB, MINUS_3DB],
+        1e-6,
+        "5.0 centre",
+    );
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 0.0, 0.0, 1.0], 2)?,
+        &[0.0, MINUS_3DB],
+        1e-6,
+        "5.0 right surround",
+    );
+    // 7.1: L R C LFE Lb Rb Ls Rs
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0], 2)?,
+        &[2.0 * MINUS_3DB, 0.0],
+        1e-6,
+        "7.1 left back + side",
+    );
+    assert_buffer_eq(
+        &convert(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1)?,
+        &[MINUS_3DB],
+        1e-6,
+        "7.1 centre mono",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_channel_layouts_without_a_mapping_keep_previous_rules() -> Result<()> {
+    // 3 channels -> mono: plain average.
+    assert_buffer_eq(&convert(&[0.3, 0.6, 0.9], 1)?, &[0.6], 1e-6, "3 -> 1");
+    // 3 channels -> stereo: nearest channel.
+    assert_eq!(convert(&[0.3, 0.6, 0.9], 2)?, vec![0.3, 0.6]);
+    // Mono -> 5.1 copies the signal everywhere.
+    assert_eq!(convert(&[0.25], 6)?, vec![0.25; 6]);
+    // Stereo -> 4: nearest channel.
+    assert_eq!(convert(&[0.1, 0.2], 4)?, vec![0.1, 0.2, 0.2, 0.2]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Band-limited resampling (rate / speed)
+// ---------------------------------------------------------------------------
+
+fn tone(sample_rate: u32, channels: u16, freq: f64, amplitude: f64, frames: usize) -> AudioBuffer {
+    let mut samples = Vec::with_capacity(frames * usize::from(channels));
+    for n in 0..frames {
+        let value = (amplitude
+            * (std::f64::consts::TAU * freq * n as f64 / f64::from(sample_rate)).sin())
+            as f32;
+        samples.extend(std::iter::repeat_n(value, usize::from(channels)));
+    }
+    AudioBuffer {
+        spec: AudioSpec {
+            sample_rate,
+            channels,
+        },
+        samples,
+    }
+}
+
+/// Channel `channel` of frames `skip..frames - skip`.
+fn middle(audio: &AudioBuffer, channel: usize, skip: usize) -> Vec<f64> {
+    let channels = usize::from(audio.spec.channels);
+    (skip..audio.frames() - skip)
+        .map(|frame| f64::from(audio.samples[frame * channels + channel]))
+        .collect()
+}
+
+fn rms(values: &[f64]) -> f64 {
+    (values.iter().map(|v| v * v).sum::<f64>() / values.len() as f64).sqrt()
+}
+
+/// Least-squares amplitude of a `freq` Hz sinusoid in `values` (which start at
+/// output frame `first`), and the RMS of what is left after removing the
+/// expected zero-phase sine `amplitude * sin(2 pi f n / rate)`.
+fn fit(values: &[f64], first: usize, rate: u32, freq: f64, amplitude: f64) -> (f64, f64) {
+    let mut sin_sum = 0.0;
+    let mut cos_sum = 0.0;
+    let mut residual = Vec::with_capacity(values.len());
+    for (offset, value) in values.iter().enumerate() {
+        let phase = std::f64::consts::TAU * freq * (first + offset) as f64 / f64::from(rate);
+        sin_sum += value * phase.sin();
+        cos_sum += value * phase.cos();
+        residual.push(value - amplitude * phase.sin());
+    }
+    let n = values.len() as f64;
+    let fitted = 2.0 * (sin_sum * sin_sum + cos_sum * cos_sum).sqrt() / n;
+    (fitted, rms(&residual))
+}
+
+fn db(ratio: f64) -> f64 {
+    20.0 * ratio.log10()
+}
+
+#[test]
+fn test_rate_48k_to_8k_removes_6khz_tone_instead_of_aliasing_it() -> Result<()> {
+    let mut audio = tone(48_000, 1, 6_000.0, 0.5, 24_000);
+    let input_rms = rms(&middle(&audio, 0, 0));
+    EffectChain::new(vec![Effect::Rate { sample_rate: 8_000 }]).apply(&mut audio)?;
+    assert_eq!(audio.spec.sample_rate, 8_000);
+    assert_eq!(audio.frames(), 4_000);
+    // Skip the edges, where the abrupt start/end of the tone has in-band energy.
+    let output_rms = rms(&middle(&audio, 0, 200));
+    let attenuation = db(output_rms / input_rms);
+    assert!(
+        attenuation < -60.0,
+        "6 kHz tone only attenuated by {attenuation:.1} dB (it would alias to 2 kHz)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_rate_stopband_attenuation_is_at_least_80_db() -> Result<()> {
+    // The stopband starts at the output Nyquist frequency (4 kHz here).
+    for freq in [4_100.0, 5_000.0, 7_900.0, 12_000.0, 23_000.0] {
+        let mut audio = tone(48_000, 1, freq, 0.5, 24_000);
+        let input_rms = rms(&middle(&audio, 0, 0));
+        EffectChain::new(vec![Effect::Rate { sample_rate: 8_000 }]).apply(&mut audio)?;
+        let attenuation = db(rms(&middle(&audio, 0, 200)) / input_rms);
+        assert!(
+            attenuation < -80.0,
+            "{freq} Hz attenuated by only {attenuation:.1} dB"
+        );
+    }
+    // Upsampling: the images of a 19 kHz tone (inside the 0.9 * 22.05 kHz
+    // passband) above 22.05 kHz must be removed, leaving a clean sine at 96 kHz.
+    let amplitude = 0.5;
+    let mut audio = tone(44_100, 1, 19_000.0, amplitude, 8_820);
+    EffectChain::new(vec![Effect::Rate {
+        sample_rate: 96_000,
+    }])
+    .apply(&mut audio)?;
+    let values = middle(&audio, 0, 600);
+    let (fitted, residual) = fit(&values, 600, 96_000, 19_000.0, amplitude);
+    assert!(db(fitted / amplitude).abs() < 0.1);
+    let residual_db = db(residual / (amplitude / std::f64::consts::SQRT_2));
+    assert!(residual_db < -80.0, "imaging residual {residual_db:.1} dB");
+    Ok(())
+}
+
+#[test]
+fn test_rate_44k1_to_48k_keeps_amplitude_frequency_and_timing() -> Result<()> {
+    let amplitude = 0.5;
+    let mut audio = tone(44_100, 1, 1_000.0, amplitude, 22_050);
+    EffectChain::new(vec![Effect::Rate {
+        sample_rate: 48_000,
+    }])
+    .apply(&mut audio)?;
+    assert_eq!(audio.spec.sample_rate, 48_000);
+    assert_eq!(audio.frames(), 24_000);
+    let skip = 300;
+    let values = middle(&audio, 0, skip);
+    let (fitted, residual) = fit(&values, skip, 48_000, 1_000.0, amplitude);
+    let gain = db(fitted / amplitude);
+    assert!(gain.abs() < 0.1, "1 kHz gain changed by {gain:.3} dB");
+    // The residual against the expected, zero-phase 1 kHz sine at 48 kHz is
+    // tiny only if the frequency is right and there is no time shift.
+    let residual_db = db(residual / (amplitude / std::f64::consts::SQRT_2));
+    assert!(residual_db < -80.0, "residual {residual_db:.1} dB");
+    Ok(())
+}
+
+#[test]
+fn test_rate_with_many_phases_uses_accurate_fallback() -> Result<()> {
+    // 44100 -> 48001 has 48001 phases, so the interpolated kernel table is used.
+    let amplitude = 0.5;
+    let mut audio = tone(44_100, 1, 1_000.0, amplitude, 8_820);
+    EffectChain::new(vec![Effect::Rate {
+        sample_rate: 48_001,
+    }])
+    .apply(&mut audio)?;
+    assert_eq!(
+        audio.frames(),
+        (8_820.0_f64 * 48_001.0 / 44_100.0).round() as usize
+    );
+    let skip = 300;
+    let values = middle(&audio, 0, skip);
+    let (fitted, residual) = fit(&values, skip, 48_001, 1_000.0, amplitude);
+    assert!(db(fitted / amplitude).abs() < 0.1);
+    let residual_db = db(residual / (amplitude / std::f64::consts::SQRT_2));
+    assert!(residual_db < -80.0, "residual {residual_db:.1} dB");
+    Ok(())
+}
+
+#[test]
+fn test_rate_downsampling_keeps_passband_tone() -> Result<()> {
+    let amplitude = 0.25;
+    let mut audio = tone(48_000, 2, 1_000.0, amplitude, 24_000);
+    EffectChain::new(vec![Effect::Rate { sample_rate: 8_000 }]).apply(&mut audio)?;
+    for channel in 0..2 {
+        let values = middle(&audio, channel, 200);
+        let (fitted, residual) = fit(&values, 200, 8_000, 1_000.0, amplitude);
+        assert!(db(fitted / amplitude).abs() < 0.1, "channel {channel}");
+        assert!(db(residual / amplitude) < -70.0, "channel {channel}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_rate_output_lengths_round_frames_times_ratio() -> Result<()> {
+    for (frames, from, to) in [
+        (1_001_usize, 44_100_u32, 48_000_u32),
+        (1_000, 48_000, 44_100),
+        (7, 48_000, 8_000),
+        (333, 8_000, 22_050),
+        (10, 96_000, 8_000),
+    ] {
+        let mut audio = tone(from, 2, 100.0, 0.5, frames);
+        EffectChain::new(vec![Effect::Rate { sample_rate: to }]).apply(&mut audio)?;
+        let expected = ((frames as f64 * f64::from(to) / f64::from(from)).round() as usize).max(1);
+        assert_eq!(audio.frames(), expected, "{frames} frames {from} -> {to}");
+        assert_eq!(audio.samples.len(), expected * 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_rate_keeps_channels_independent() -> Result<()> {
+    // Left: 1 kHz tone, right: silence.
+    let source = tone(44_100, 1, 1_000.0, 0.5, 4_410);
+    let mut audio = AudioBuffer {
+        spec: AudioSpec {
+            sample_rate: 44_100,
+            channels: 2,
+        },
+        samples: source.samples.iter().flat_map(|&s| [s, 0.0]).collect(),
+    };
+    EffectChain::new(vec![Effect::Rate {
+        sample_rate: 48_000,
+    }])
+    .apply(&mut audio)?;
+    assert!(middle(&audio, 1, 0).iter().all(|value| *value == 0.0));
+    assert!(rms(&middle(&audio, 0, 100)) > 0.3);
+    Ok(())
+}
+
+#[test]
+fn test_speed_up_does_not_alias() -> Result<()> {
+    // Speeding a 3 kHz tone up 2x moves it to 6 kHz, above the 4 kHz Nyquist
+    // of an 8 kHz signal: it must be filtered out, not folded down to 2 kHz.
+    let mut audio = tone(8_000, 1, 3_000.0, 0.5, 8_000);
+    let input_rms = rms(&middle(&audio, 0, 0));
+    EffectChain::new(vec![Effect::Speed { factor: 2.0 }]).apply(&mut audio)?;
+    assert_eq!(audio.spec.sample_rate, 8_000);
+    assert_eq!(audio.frames(), 4_000);
+    let attenuation = db(rms(&middle(&audio, 0, 200)) / input_rms);
+    assert!(attenuation < -60.0, "attenuation {attenuation:.1} dB");
+    Ok(())
+}
+
+#[test]
+fn test_speed_changes_pitch_accurately() -> Result<()> {
+    for factor in [0.5_f32, 1.5, 1.1, 0.9] {
+        let amplitude = 0.5;
+        let mut audio = tone(48_000, 1, 1_000.0, amplitude, 12_000);
+        EffectChain::new(vec![Effect::Speed { factor }]).apply(&mut audio)?;
+        assert_eq!(audio.spec.sample_rate, 48_000);
+        assert_eq!(
+            audio.frames(),
+            (12_000.0 / f64::from(factor)).round() as usize,
+            "speed {factor}"
+        );
+        let skip = 300;
+        let values = middle(&audio, 0, skip);
+        let freq = 1_000.0 * f64::from(factor);
+        let (fitted, residual) = fit(&values, skip, 48_000, freq, amplitude);
+        assert!(db(fitted / amplitude).abs() < 0.1, "speed {factor}");
+        let residual_db = db(residual / (amplitude / std::f64::consts::SQRT_2));
+        assert!(
+            residual_db < -80.0,
+            "speed {factor}: residual {residual_db:.1} dB"
+        );
+    }
     Ok(())
 }

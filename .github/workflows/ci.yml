@@ -81,6 +81,17 @@ jobs:
           ACTUAL_TARGET="$(rustc -vV | sed -n 's/host: //p')"
           test "$ACTUAL_TARGET" = "${{ matrix.target }}"
 
+      - name: Verify tag matches Cargo version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION="$(cargo metadata --format-version=1 --no-deps | sed -n 's/.*"name":"soundx","version":"\([^"]*\)".*/\1/p')"
+          echo "Tag version:   ${TAG_VERSION}"
+          echo "Crate version: ${CRATE_VERSION}"
+          if [ -z "$CRATE_VERSION" ] || [ "$TAG_VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CRATE_VERSION:-<unknown>}"
+            exit 1
+          fi
+
       - name: Build release
         run: cargo build --release --locked
 
@@ -199,7 +210,7 @@ jobs:
           echo "" >> /tmp/release-notes.md
           echo "### Changes since previous tag" >> /tmp/release-notes.md
           echo "" >> /tmp/release-notes.md
-          PREV=$(git tag --sort=-version:refname | head -2 | tail -1 2>/dev/null || echo "")
+          PREV=$(git tag --sort=-version:refname | grep -vx "${GITHUB_REF_NAME}" | head -1 || true)
           if [ -n "$PREV" ]; then
             git log --pretty=format:"- %s (%h)" "${PREV}..HEAD" >> /tmp/release-notes.md 2>/dev/null || true
           else

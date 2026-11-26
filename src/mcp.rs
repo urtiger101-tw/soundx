@@ -7,11 +7,14 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_MESSAGE: u64 = 1024 * 1024;
 const MAX_OUTPUT: usize = 256 * 1024;
+/// Finite `soundx_run`/`soundx_loudness` commands that may be in flight at once.
+const MAX_FINITE: usize = 8;
 const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 #[derive(Deserialize)]
@@ -43,6 +46,7 @@ struct StartArgs {
 struct JobArgs {
     job_id: u64,
 }
+#[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EndpointArgs {
@@ -52,14 +56,17 @@ struct EndpointArgs {
     volume: Option<f32>,
     mute: Option<bool>,
 }
+#[cfg(windows)]
 fn output_flow() -> String {
     "output".into()
 }
+#[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionsArgs {
     device_id: Option<String>,
 }
+#[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionArgs {
@@ -91,7 +98,11 @@ fn capture(mut input: impl Read + Send + 'static) -> JoinHandle<std::io::Result<
     })
 }
 
-/// Closing the owning server also terminates its children after a forced exit.
+/// Windows only: closing the owning server's handle also terminates its
+/// children after a forced exit. On Unix there is no equivalent without extra
+/// dependencies (no portable parent-death signal), so a SIGKILLed server can
+/// leave `record --continuous` / `play --loop` children running; they are only
+/// reaped on orderly shutdown (stdin EOF or a failed stdout write).
 #[cfg(windows)]
 struct WindowsJob(windows::Win32::Foundation::HANDLE);
 #[cfg(windows)]
@@ -212,6 +223,12 @@ impl Job {
         self.result = Some(result.clone());
         Ok(result)
     }
+    /// Kill immediately (no graceful stop, no output capture).
+    fn abort(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.result = Some(json!({"state":"cancelled"}));
+    }
     fn stop(&mut self) -> Result<Value> {
         if self.child.try_wait()?.is_none() {
             std::fs::write(&self.stop_file, b"stop\n")
@@ -259,12 +276,65 @@ fn validate_arguments(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A finite command in flight, answered when it exits or times out.
+struct Running {
+    id: Value,
+    job: Job,
+    started: Instant,
+    timeout: Duration,
+    loudness: bool,
+}
+enum Call {
+    Done(Value),
+    Finite(Box<Running>),
+}
+enum Input {
+    Line(Vec<u8>),
+    Oversized,
+    Eof,
+    Failed(String),
+}
+fn spawn_reader(sender: Sender<Input>) {
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        loop {
+            let mut line = Vec::new();
+            let message = match (&mut input)
+                .take(MAX_MESSAGE + 1)
+                .read_until(b'\n', &mut line)
+            {
+                Ok(0) => Input::Eof,
+                Ok(count) if count as u64 > MAX_MESSAGE => {
+                    let skipped = if line.ends_with(b"\n") {
+                        Ok(0)
+                    } else {
+                        input.skip_until(b'\n')
+                    };
+                    match skipped {
+                        Ok(_) => Input::Oversized,
+                        Err(error) => Input::Failed(error.to_string()),
+                    }
+                }
+                Ok(_) => Input::Line(line),
+                Err(error) => Input::Failed(error.to_string()),
+            };
+            let last = matches!(message, Input::Eof | Input::Failed(_));
+            if sender.send(message).is_err() || last {
+                break;
+            }
+        }
+    });
+}
+
 struct Server {
     initialized: bool,
     ready: bool,
     directory: PathBuf,
     jobs: BTreeMap<u64, Job>,
     next_job: u64,
+    running: Vec<Running>,
+    next_run: u64,
 }
 impl Server {
     fn new() -> Result<Self> {
@@ -278,31 +348,125 @@ impl Server {
             directory,
             jobs: BTreeMap::new(),
             next_job: 1,
+            running: Vec::new(),
+            next_run: 1,
         })
     }
-    /// Run a finite command to completion (or kill it at the timeout).
-    fn run_finite(&mut self, arguments: Vec<String>, timeout_seconds: u64) -> Result<Value> {
+    /// Start a finite command; it is answered later by `poll_running`.
+    fn start_finite(
+        &mut self,
+        arguments: Vec<String>,
+        timeout_seconds: u64,
+        loudness: bool,
+    ) -> Result<Call> {
         if !(1..=600).contains(&timeout_seconds) {
             bail!("timeout_seconds must be between 1 and 600");
         }
-        let mut job = Job::spawn(arguments, self.directory.join("run.stop"))?;
-        let started = Instant::now();
-        loop {
-            let result = job.poll()?;
-            if result["state"] != "running" {
-                return Ok(result);
-            }
-            if started.elapsed() >= Duration::from_secs(timeout_seconds) {
-                job.child.kill()?;
-                job.child.wait()?;
-                let mut result = job.poll()?;
-                result["state"] = json!("timed_out");
-                return Ok(result);
-            }
-            thread::sleep(Duration::from_millis(10));
+        if self.running.len() >= MAX_FINITE {
+            bail!(
+                "too many concurrent soundx_run/soundx_loudness commands (limit: {MAX_FINITE}); wait for one to finish or cancel it"
+            );
+        }
+        let run = self.next_run;
+        self.next_run += 1;
+        let job = Job::spawn(arguments, self.directory.join(format!("run-{run}.stop")))?;
+        Ok(Call::Finite(Box::new(Running {
+            id: Value::Null,
+            job,
+            started: Instant::now(),
+            timeout: Duration::from_secs(timeout_seconds),
+            loudness,
+        })))
+    }
+    /// Collect responses for finite commands that exited or timed out.
+    fn poll_running(&mut self) -> Vec<Value> {
+        let mut responses = Vec::new();
+        let mut index = 0;
+        while index < self.running.len() {
+            let run = &mut self.running[index];
+            let outcome = (|| -> Result<Option<Value>> {
+                let mut result = run.job.poll()?;
+                if result["state"] == "running" {
+                    if run.started.elapsed() < run.timeout {
+                        return Ok(None);
+                    }
+                    run.job.child.kill()?;
+                    run.job.child.wait()?;
+                    result = run.job.poll()?;
+                    result["state"] = json!("timed_out");
+                }
+                if run.loudness {
+                    result["loudness"] = result["output_json"].clone();
+                }
+                Ok(Some(result))
+            })();
+            let result = match outcome {
+                Ok(None) => {
+                    index += 1;
+                    continue;
+                }
+                Ok(Some(value)) => tool_outcome(value),
+                Err(error) => tool_result(json!({"error":format!("{error:#}")}), true),
+            };
+            let mut run = self.running.remove(index);
+            run.job.abort();
+            responses.push(json!({"jsonrpc":"2.0","id":run.id,"result":result}));
+        }
+        responses
+    }
+    fn cancel(&mut self, request_id: &Value) {
+        if let Some(index) = self.running.iter().position(|run| &run.id == request_id) {
+            self.running.remove(index).job.abort();
         }
     }
-    fn call(&mut self, name: &str, arguments: Value) -> Result<Value> {
+    fn shutdown(&mut self) {
+        for mut run in self.running.drain(..) {
+            run.job.abort();
+        }
+        // Request all stops before waiting, so recordings end together.
+        for job in self.jobs.values() {
+            let _ = std::fs::write(&job.stop_file, b"stop\n");
+        }
+        self.jobs.clear();
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+    fn serve_loop(&mut self, input: &Receiver<Input>, output: &mut impl Write) -> Result<()> {
+        loop {
+            let message = if self.running.is_empty() {
+                match input.recv() {
+                    Ok(message) => Some(message),
+                    Err(_) => break,
+                }
+            } else {
+                match input.recv_timeout(Duration::from_millis(10)) {
+                    Ok(message) => Some(message),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            };
+            let mut responses = Vec::new();
+            match message {
+                None => {}
+                Some(Input::Eof) => break,
+                Some(Input::Failed(error)) => bail!("failed to read stdin: {error}"),
+                Some(Input::Oversized) => {
+                    responses.push(rpc_error(Value::Null, -32600, "Message exceeds 1 MiB"));
+                }
+                Some(Input::Line(line)) => match serde_json::from_slice(&line) {
+                    Ok(request) => responses.extend(self.dispatch(request)),
+                    Err(_) => responses.push(rpc_error(Value::Null, -32700, "Parse error")),
+                },
+            }
+            responses.extend(self.poll_running());
+            for response in responses {
+                serde_json::to_writer(&mut *output, &response)?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+            }
+        }
+        Ok(())
+    }
+    fn call(&mut self, name: &str, arguments: Value) -> Result<Call> {
         match name {
             "soundx_run" => {
                 let args: RunArgs = serde_json::from_value(arguments)?;
@@ -328,7 +492,7 @@ impl Server {
                         "command is not supported by soundx_run; use soundx_start for play/record and Windows tools for volume control"
                     );
                 }
-                self.run_finite(args.arguments, args.timeout_seconds)
+                self.start_finite(args.arguments, args.timeout_seconds, false)
             }
             "soundx_loudness" => {
                 let args: LoudnessArgs = serde_json::from_value(arguments)?;
@@ -340,9 +504,7 @@ impl Server {
                 arguments.push("--json".into());
                 arguments.push("--".into());
                 arguments.extend(args.inputs);
-                let mut result = self.run_finite(arguments, args.timeout_seconds)?;
-                result["loudness"] = result["output_json"].clone();
-                Ok(result)
+                self.start_finite(arguments, args.timeout_seconds, true)
             }
             "soundx_start" => {
                 let args: StartArgs = serde_json::from_value(arguments)?;
@@ -372,7 +534,9 @@ impl Server {
                 let job = Job::spawn(args.arguments, self.directory.join(format!("{id}.stop")))?;
                 let process_id = job.child.id();
                 self.jobs.insert(id, job);
-                Ok(json!({"job_id":id,"state":"started","process_id":process_id}))
+                Ok(Call::Done(
+                    json!({"job_id":id,"state":"started","process_id":process_id}),
+                ))
             }
             "soundx_jobs" => {
                 require_empty(&arguments)?;
@@ -382,7 +546,7 @@ impl Server {
                     result["job_id"] = json!(id);
                     jobs.push(result);
                 }
-                Ok(json!({"jobs":jobs}))
+                Ok(Call::Done(json!({"jobs":jobs})))
             }
             "soundx_stop" => {
                 let args: JobArgs = serde_json::from_value(arguments)?;
@@ -392,12 +556,14 @@ impl Server {
                     .context("unknown job_id in this MCP session")?;
                 let mut result = job.stop()?;
                 result["job_id"] = json!(args.job_id);
-                Ok(result)
+                Ok(Call::Done(result))
             }
+            #[cfg(windows)]
             "soundx_windows_devices" => {
                 require_empty(&arguments)?;
-                crate::windows_audio::endpoints()
+                crate::windows_audio::endpoints().map(Call::Done)
             }
+            #[cfg(windows)]
             "soundx_windows_endpoint" => {
                 let args: EndpointArgs = serde_json::from_value(arguments)?;
                 crate::windows_audio::endpoint(
@@ -406,11 +572,14 @@ impl Server {
                     args.volume,
                     args.mute,
                 )
+                .map(Call::Done)
             }
+            #[cfg(windows)]
             "soundx_windows_sessions" => {
                 let args: SessionsArgs = serde_json::from_value(arguments)?;
-                crate::windows_audio::sessions(args.device_id.as_deref())
+                crate::windows_audio::sessions(args.device_id.as_deref()).map(Call::Done)
             }
+            #[cfg(windows)]
             "soundx_windows_session" => {
                 let args: SessionArgs = serde_json::from_value(arguments)?;
                 crate::windows_audio::session(
@@ -419,6 +588,7 @@ impl Server {
                     args.volume,
                     args.mute,
                 )
+                .map(Call::Done)
             }
             _ => bail!("unknown tool: {name}"),
         }
@@ -439,6 +609,11 @@ impl Server {
         let Some(id) = id else {
             if method == "notifications/initialized" && self.initialized {
                 self.ready = true;
+            } else if method == "notifications/cancelled"
+                && let Some(request_id) = request.get("params").and_then(|p| p.get("requestId"))
+            {
+                // Per MCP, a cancelled request gets no response.
+                self.cancel(request_id);
             }
             return None;
         };
@@ -468,7 +643,7 @@ impl Server {
                 json!({"protocolVersion":if VERSIONS.contains(&version) {version} else {VERSIONS[0]},
                     "capabilities":{"tools":{"listChanged":false},"resources":{}},
                     "serverInfo":{"name":"soundx","version":env!("CARGO_PKG_VERSION")},
-                    "instructions":"Local audio processing. Use absolute file paths. Start play/record with soundx_start, inspect soundx_jobs, and finalize with soundx_stop. Windows volume changes affect the selected endpoint or session."})
+                    "instructions":instructions()})
             }
             "ping" => json!({}),
             _ if !self.ready => {
@@ -487,10 +662,12 @@ impl Server {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 match self.call(name, args) {
-                    Ok(value) => {
-                        let error = matches!(value["state"].as_str(), Some("failed" | "timed_out"))
-                            || value["forced_stop"] == true;
-                        tool_result(value, error)
+                    Ok(Call::Done(value)) => tool_outcome(value),
+                    Ok(Call::Finite(mut run)) => {
+                        // Answered by `poll_running` when the command ends.
+                        run.id = id;
+                        self.running.push(*run);
+                        return None;
                     }
                     Err(error) => tool_result(json!({"error":format!("{error:#}")}), true),
                 }
@@ -514,13 +691,22 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        // Request all stops before waiting, so recordings end together.
-        for job in self.jobs.values() {
-            let _ = std::fs::write(&job.stop_file, b"stop\n");
-        }
-        self.jobs.clear();
-        let _ = std::fs::remove_dir(&self.directory);
+        self.shutdown();
     }
+}
+fn instructions() -> String {
+    let mut text = String::from(
+        "Local audio processing. Use absolute file paths. Start play/record with soundx_start, inspect soundx_jobs, and finalize with soundx_stop. soundx_run and soundx_loudness may be in flight concurrently; notifications/cancelled kills one.",
+    );
+    if cfg!(windows) {
+        text.push_str(" Windows volume changes affect the selected endpoint or session.");
+    }
+    text
+}
+fn tool_outcome(value: Value) -> Value {
+    let error = matches!(value["state"].as_str(), Some("failed" | "timed_out"))
+        || value["forced_stop"] == true;
+    tool_result(value, error)
 }
 fn require_empty(value: &Value) -> Result<()> {
     if !value.as_object().is_some_and(|object| object.is_empty()) {
@@ -542,58 +728,106 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 fn schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
-fn tools() -> Vec<Value> {
-    let arguments = json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256});
+type ToolDef = (&'static str, &'static str, Value, bool);
+#[cfg(windows)]
+fn windows_tools() -> Vec<ToolDef> {
     let device =
         json!({"type":"string","description":"Exact endpoint id; omit for default device"});
     let volume = json!({"type":"number","minimum":0,"maximum":100});
     let mute = json!({"type":"boolean"});
-    [
-        ("soundx_run", "Run finite soundx CLI processing with separate arguments, no shell. Commands: info, loudness, formats, devices, convert, concat, mix, synth, stream, batch, run-plan, help, --help, --version. Use help for flags. May create/overwrite output files. Returns exit status and captured output.", schema(json!({"arguments":arguments,"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}), &["arguments"]), false),
-        ("soundx_loudness", "Measure ITU-R BS.1770-4 / EBU R128 loudness of audio files: integrated LUFS, loudness range (LRA), true peak (dBTP), sample peak, momentary and short-term maxima. Read-only. Returns `loudness`, an array with one object per input (integrated_lufs is null for silence).", schema(json!({"inputs":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,"description":"Absolute audio file paths"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}), &["inputs"]), true),
-        ("soundx_start", "Start play or record as a managed job. Includes looping playback and continuous WAV capture. Returns a job id, not completion. Jobs end when this MCP connection closes. Use soundx_stop to finalize recording.", schema(json!({"arguments":arguments}), &["arguments"]), false),
-        ("soundx_jobs", "Read states and captured results of this connection's jobs. At most 32 jobs are retained.", schema(json!({}), &[]), true),
-        ("soundx_stop", "Gracefully stop a managed play/record job and return its final status. Never accepts arbitrary process ids.", schema(json!({"job_id":{"type":"integer","minimum":1}}), &["job_id"]), false),
-        ("soundx_windows_devices", "Windows Core Audio: enumerate active input/output endpoints, defaults and volume/mute state.", schema(json!({}), &[]), true),
-        ("soundx_windows_endpoint", "Windows Core Audio: read endpoint volume/mute; supply volume (0-100) or mute to change it and read back the result. Omit both for read-only.", schema(json!({"device_id":device,"flow":{"type":"string","enum":["input","output"],"default":"output"},"volume":volume,"mute":mute}), &[]), false),
-        ("soundx_windows_sessions", "Windows Core Audio: list output audio sessions and their stable ids, process ids and volume/mute state.", schema(json!({"device_id":device}), &[]), true),
-        ("soundx_windows_session", "Windows Core Audio: read or change a single output session selected by its exact session id. Volume uses 0-100 percent.", schema(json!({"device_id":device,"session_id":{"type":"string"},"volume":volume,"mute":mute}), &["session_id"]), false),
-    ].into_iter().map(|(name, description, input, read_only)| json!({"name":name,"description":description,"inputSchema":input,
+    vec![
+        (
+            "soundx_windows_devices",
+            "Windows Core Audio: enumerate active input/output endpoints, defaults and volume/mute state.",
+            schema(json!({}), &[]),
+            true,
+        ),
+        (
+            "soundx_windows_endpoint",
+            "Windows Core Audio: read endpoint volume/mute; supply volume (0-100) or mute to change it and read back the result. Omit both for read-only.",
+            schema(
+                json!({"device_id":device,"flow":{"type":"string","enum":["input","output"],"default":"output"},"volume":volume,"mute":mute}),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "soundx_windows_sessions",
+            "Windows Core Audio: list output audio sessions and their stable ids, process ids and volume/mute state.",
+            schema(json!({"device_id":device}), &[]),
+            true,
+        ),
+        (
+            "soundx_windows_session",
+            "Windows Core Audio: read or change a single output session selected by its exact session id. Volume uses 0-100 percent.",
+            schema(
+                json!({"device_id":device,"session_id":{"type":"string"},"volume":volume,"mute":mute}),
+                &["session_id"],
+            ),
+            false,
+        ),
+    ]
+}
+fn tools() -> Vec<Value> {
+    let arguments = json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256});
+    #[allow(unused_mut)]
+    let mut list: Vec<ToolDef> = vec![
+        (
+            "soundx_run",
+            "Run finite soundx CLI processing with separate arguments, no shell. Commands: info, loudness, formats, devices, convert, concat, mix, synth, stream, batch, run-plan, help, --help, --version. Use help for flags. May create/overwrite output files. Returns exit status and captured output.",
+            schema(
+                json!({"arguments":arguments,"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}),
+                &["arguments"],
+            ),
+            false,
+        ),
+        (
+            "soundx_loudness",
+            "Measure ITU-R BS.1770-4 / EBU R128 loudness of audio files: integrated LUFS, loudness range (LRA), true peak (dBTP), sample peak, momentary and short-term maxima. Read-only. Returns `loudness`, an array with one object per input (integrated_lufs is null for silence).",
+            schema(
+                json!({"inputs":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,"description":"Absolute audio file paths"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"default":120}}),
+                &["inputs"],
+            ),
+            true,
+        ),
+        (
+            "soundx_start",
+            "Start play or record as a managed job. Includes looping playback and continuous WAV capture. Returns a job id, not completion. Jobs are stopped when this MCP connection closes normally (stdin EOF); if the server is killed, Windows ends them but Unix may leave them running. Use soundx_stop to finalize recording.",
+            schema(json!({"arguments":arguments}), &["arguments"]),
+            false,
+        ),
+        (
+            "soundx_jobs",
+            "Read states and captured results of this connection's jobs. At most 32 jobs are retained.",
+            schema(json!({}), &[]),
+            true,
+        ),
+        (
+            "soundx_stop",
+            "Gracefully stop a managed play/record job and return its final status. Never accepts arbitrary process ids.",
+            schema(
+                json!({"job_id":{"type":"integer","minimum":1}}),
+                &["job_id"],
+            ),
+            false,
+        ),
+    ];
+    #[cfg(windows)]
+    list.extend(windows_tools());
+    list.into_iter().map(|(name, description, input, read_only)| json!({"name":name,"description":description,"inputSchema":input,
         "annotations":{"readOnlyHint":read_only,"destructiveHint":!read_only,"openWorldHint":false}})).collect()
 }
 
 pub fn serve() -> Result<()> {
     let mut server = Server::new()?;
-    let stdin = std::io::stdin();
+    let (sender, receiver) = channel();
+    spawn_reader(sender);
     let stdout = std::io::stdout();
-    let mut input = stdin.lock();
     let mut output = stdout.lock();
-    loop {
-        let mut line = Vec::new();
-        let count = (&mut input)
-            .take(MAX_MESSAGE + 1)
-            .read_until(b'\n', &mut line)?;
-        if count == 0 {
-            break;
-        }
-        let response = if count as u64 > MAX_MESSAGE {
-            if !line.ends_with(b"\n") {
-                input.skip_until(b'\n')?;
-            }
-            Some(rpc_error(Value::Null, -32600, "Message exceeds 1 MiB"))
-        } else {
-            match serde_json::from_slice(&line) {
-                Ok(request) => server.dispatch(request),
-                Err(_) => Some(rpc_error(Value::Null, -32700, "Parse error")),
-            }
-        };
-        if let Some(response) = response {
-            serde_json::to_writer(&mut output, &response)?;
-            output.write_all(b"\n")?;
-            output.flush()?;
-        }
-    }
-    Ok(())
+    let result = server.serve_loop(&receiver, &mut output);
+    // Always clean up, including after a failed stdout write.
+    server.shutdown();
+    result
 }
 
 #[cfg(test)]
@@ -623,7 +857,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            if cfg!(windows) { 9 } else { 5 }
         );
         assert_eq!(server.dispatch(json!([])).unwrap()["error"]["code"], -32600);
         assert_eq!(

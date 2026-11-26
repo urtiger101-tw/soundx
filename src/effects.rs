@@ -181,8 +181,8 @@ impl EffectChain {
     pub fn apply(&self, audio: &mut AudioBuffer) -> Result<()> {
         for effect in &self.effects {
             match effect {
-                Effect::GainDb(db) => gain_db(audio, *db),
-                Effect::Normalize { target_db } => normalize(audio, *target_db),
+                Effect::GainDb(db) => gain_db(audio, *db)?,
+                Effect::Normalize { target_db } => normalize(audio, *target_db)?,
                 Effect::Trim {
                     start_sec,
                     duration_sec,
@@ -296,23 +296,48 @@ impl EffectChain {
     }
 }
 
-fn gain_db(audio: &mut AudioBuffer, db: f32) {
+fn gain_db(audio: &mut AudioBuffer, db: f32) -> Result<()> {
+    if !db.is_finite() {
+        bail!("gain must be a finite number of dB (got {db})");
+    }
     let factor = 10.0_f32.powf(db / 20.0);
+    if !factor.is_finite() {
+        bail!("gain of {db} dB is too large");
+    }
     for sample in &mut audio.samples {
         *sample *= factor;
     }
+    Ok(())
 }
 
-fn normalize(audio: &mut AudioBuffer, target_db: f32) {
+fn normalize(audio: &mut AudioBuffer, target_db: f32) -> Result<()> {
+    if !target_db.is_finite() {
+        bail!("normalize target must be a finite number of dB (got {target_db})");
+    }
     let peak = audio.peak();
     if peak == 0.0 {
-        return;
+        return Ok(());
+    }
+    if !peak.is_finite() {
+        bail!("normalize requires finite samples");
     }
     let target = 10.0_f32.powf(target_db / 20.0);
     let factor = target / peak;
+    if !factor.is_finite() {
+        bail!("normalize target of {target_db} dB is too large");
+    }
     for sample in &mut audio.samples {
         *sample *= factor;
     }
+    Ok(())
+}
+
+/// Require a finite, non-negative duration in seconds.
+fn ensure_duration(value: f32, what: &str) -> Result<()> {
+    if !value.is_finite() || value < 0.0 {
+        bail!("{what} must be a finite number of seconds >= 0 (got {value})");
+    }
+    Ok(())
 }
 
 fn dither(audio: &mut AudioBuffer, bits: u16) -> Result<()> {
@@ -757,17 +782,19 @@ fn wsola(
 }
 
 fn trim(audio: &mut AudioBuffer, start_sec: f32, duration_sec: Option<f32>) -> Result<()> {
-    if start_sec < 0.0 {
-        bail!("trim start must be >= 0");
-    }
-    if duration_sec.is_some_and(|duration| duration < 0.0) {
-        bail!("trim duration must be >= 0");
+    ensure_duration(start_sec, "trim start")?;
+    if let Some(duration) = duration_sec {
+        ensure_duration(duration, "trim duration")?;
     }
 
     let channels = usize::from(audio.spec.channels);
     let start_frame = seconds_to_frames(start_sec, audio.spec.sample_rate);
+    // `seconds_to_frames` saturates at usize::MAX for huge durations, so the end
+    // must saturate too: `trim 0.2 1e30` keeps everything after 0.2 s.
     let end_frame = duration_sec
-        .map(|duration| start_frame + seconds_to_frames(duration, audio.spec.sample_rate))
+        .map(|duration| {
+            start_frame.saturating_add(seconds_to_frames(duration, audio.spec.sample_rate))
+        })
         .unwrap_or_else(|| audio.frames())
         .min(audio.frames());
 
@@ -783,9 +810,8 @@ fn trim(audio: &mut AudioBuffer, start_sec: f32, duration_sec: Option<f32>) -> R
 }
 
 fn fade(audio: &mut AudioBuffer, in_sec: f32, out_sec: f32) -> Result<()> {
-    if in_sec < 0.0 || out_sec < 0.0 {
-        bail!("fade durations must be >= 0");
-    }
+    ensure_duration(in_sec, "fade-in duration")?;
+    ensure_duration(out_sec, "fade-out duration")?;
     let channels = usize::from(audio.spec.channels);
     let frames = audio.frames();
     let fade_in_frames = seconds_to_frames(in_sec, audio.spec.sample_rate).min(frames);
@@ -814,59 +840,391 @@ fn reverse(audio: &mut AudioBuffer) {
     audio.samples = reversed;
 }
 
+/// Play the audio `factor` times faster, changing pitch and duration together
+/// (the sample rate is unchanged). This is a band-limited resampling with a
+/// step of `factor` input frames per output frame; when speeding up, the
+/// anti-aliasing cutoff follows the output Nyquist frequency.
 fn speed(audio: &mut AudioBuffer, factor: f32) -> Result<()> {
-    if factor <= 0.0 {
-        bail!("speed factor must be > 0");
+    if !factor.is_finite() || factor <= 0.0 {
+        bail!("speed factor must be finite and > 0 (got {factor})");
     }
-    if factor == 1.0 || audio.samples.is_empty() {
-        return Ok(());
-    }
-
     let channels = usize::from(audio.spec.channels);
-    let old_frames = audio.frames();
-    if old_frames <= 1 {
+    if factor == 1.0 || audio.samples.is_empty() || channels == 0 {
         return Ok(());
     }
 
-    let new_frames = ((old_frames as f64) / factor as f64).round().max(1.0) as usize;
-    let mut output = vec![0.0; new_frames * channels];
-
-    for new_frame in 0..new_frames {
-        let source_pos = new_frame as f64 * factor as f64;
-        let left = source_pos.floor().min((old_frames - 1) as f64) as usize;
-        let right = (left + 1).min(old_frames - 1);
-        let fraction = (source_pos - left as f64) as f32;
-
-        for channel in 0..channels {
-            let a = audio.samples[left * channels + channel];
-            let b = audio.samples[right * channels + channel];
-            output[new_frame * channels + channel] = a + (b - a) * fraction;
-        }
+    let frames = audio.frames();
+    let out_frames_f = (frames as f64 / f64::from(factor)).round().max(1.0);
+    if out_frames_f > (isize::MAX as usize / channels / std::mem::size_of::<f32>()) as f64 {
+        bail!("speed {factor} would produce an output that is too large");
     }
-
-    audio.samples = output;
+    let out_frames = out_frames_f as usize;
+    let step = match exact_ratio(f64::from(factor), RESAMPLE_MAX_EXACT_PHASES) {
+        Some((num, den)) => ResampleStep::Ratio { num, den },
+        None => ResampleStep::Real(f64::from(factor)),
+    };
+    audio.samples = resample_interleaved(&audio.samples, channels, step, out_frames)?;
     Ok(())
 }
 
-fn pad(audio: &mut AudioBuffer, start_sec: f32, end_sec: f32) -> Result<()> {
-    if start_sec < 0.0 || end_sec < 0.0 {
-        bail!("pad durations must be >= 0");
+// ---------------------------------------------------------------------------
+// Band-limited resampling (shared by `rate` and `speed`)
+// ---------------------------------------------------------------------------
+
+/// Kaiser-window design target: stopband attenuation in dB.
+const RESAMPLE_STOPBAND_DB: f64 = 100.0;
+/// Passband edge as a fraction of the lower of the two Nyquist frequencies.
+/// The stopband starts at that Nyquist frequency, so nothing above it aliases.
+const RESAMPLE_PASSBAND: f64 = 0.90;
+/// Kernel table resolution (points per low-rate sample) for arbitrary phases.
+const RESAMPLE_TABLE_DENSITY: usize = 4096;
+/// Largest phase count for which an exact polyphase bank is precomputed.
+const RESAMPLE_MAX_EXACT_PHASES: u64 = 1024;
+/// Largest exact polyphase bank, in coefficients (16 MiB of f32).
+const RESAMPLE_MAX_BANK: usize = 1 << 22;
+/// Largest filter half-length, in input frames (limits extreme ratios).
+const RESAMPLE_MAX_RADIUS: f64 = (1 << 22) as f64;
+
+/// How far the read position advances in the input per output frame.
+#[derive(Debug, Clone, Copy)]
+enum ResampleStep {
+    /// Exactly `num / den` input frames per output frame.
+    Ratio { num: u64, den: u64 },
+    /// An arbitrary step, tracked in f64.
+    Real(f64),
+}
+
+impl ResampleStep {
+    fn value(self) -> f64 {
+        match self {
+            Self::Ratio { num, den } => num as f64 / den as f64,
+            Self::Real(step) => step,
+        }
+    }
+}
+
+/// Windowed-sinc low-pass kernel. Distances are measured in input frames;
+/// `scale` (= min(1, output rate / input rate)) stretches the kernel when
+/// downsampling so that the cutoff tracks the output Nyquist frequency.
+struct SincKernel {
+    /// Cutoff in cycles per low-rate sample (between passband and Nyquist).
+    cutoff: f64,
+    /// Half-width of the window in low-rate samples.
+    half_width: f64,
+    beta: f64,
+    i0_beta: f64,
+    scale: f64,
+    /// Half-length of the filter in input frames; the filter has 2 * radius taps.
+    radius: usize,
+}
+
+impl SincKernel {
+    fn new(step: f64) -> Result<Self> {
+        if !step.is_finite() || step <= 0.0 {
+            bail!("resampling step must be finite and > 0");
+        }
+        let scale = (1.0 / step).min(1.0);
+        // Kaiser's design formulas: transition width as a fraction of the
+        // low sample rate, then the filter length for the target attenuation.
+        let transition = (1.0 - RESAMPLE_PASSBAND) * 0.5;
+        let length = ((RESAMPLE_STOPBAND_DB - 7.95) / (14.36 * transition)).ceil() + 1.0;
+        let half_width = (length / 2.0).ceil();
+        let beta = 0.1102 * (RESAMPLE_STOPBAND_DB - 8.7);
+        let radius = (half_width / scale).ceil();
+        if radius > RESAMPLE_MAX_RADIUS {
+            bail!("resampling ratio 1:{step} is too extreme");
+        }
+        Ok(Self {
+            cutoff: (1.0 + RESAMPLE_PASSBAND) * 0.25,
+            half_width,
+            beta,
+            i0_beta: bessel_i0(beta),
+            scale,
+            radius: radius as usize,
+        })
     }
 
+    /// Kernel value (without the DC normalisation) at `u` low-rate samples.
+    fn shape(&self, u: f64) -> f64 {
+        let ratio = u / self.half_width;
+        if ratio.abs() >= 1.0 {
+            return 0.0;
+        }
+        let x = 2.0 * self.cutoff * u;
+        let sinc = if x.abs() < 1.0e-12 {
+            1.0
+        } else {
+            (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+        };
+        2.0 * self.cutoff * sinc * bessel_i0(self.beta * (1.0 - ratio * ratio).sqrt())
+            / self.i0_beta
+    }
+
+    fn taps(&self) -> usize {
+        2 * self.radius
+    }
+
+    /// Coefficients for an output frame that sits `phase` (0 <= phase < 1)
+    /// input frames after input frame `i`. Tap `k` multiplies input frame
+    /// `i + 1 - radius + k`, at distance `phase + radius - 1 - k`.
+    fn fill_exact(&self, phase: f64, coefficients: &mut [f32]) {
+        let offset = phase + self.radius as f64 - 1.0;
+        let mut sum = 0.0;
+        let mut values = Vec::with_capacity(coefficients.len());
+        for k in 0..coefficients.len() {
+            let value = self.shape((offset - k as f64) * self.scale);
+            sum += value;
+            values.push(value);
+        }
+        normalise_into(&values, sum, coefficients);
+    }
+
+    /// Kernel sampled every 1/RESAMPLE_TABLE_DENSITY low-rate samples.
+    fn table(&self) -> Vec<f32> {
+        let points = (self.half_width * RESAMPLE_TABLE_DENSITY as f64).ceil() as usize + 2;
+        (0..points)
+            .map(|index| self.shape(index as f64 / RESAMPLE_TABLE_DENSITY as f64) as f32)
+            .collect()
+    }
+
+    /// Like `fill_exact`, but reads the kernel from `table` with linear
+    /// interpolation (used for phases that are not on a precomputed grid).
+    fn fill_from_table(&self, table: &[f32], phase: f64, coefficients: &mut [f32]) {
+        let offset = phase + self.radius as f64 - 1.0;
+        let density = RESAMPLE_TABLE_DENSITY as f64;
+        let mut sum = 0.0_f64;
+        for (k, coefficient) in coefficients.iter_mut().enumerate() {
+            let position = ((offset - k as f64) * self.scale).abs() * density;
+            let index = position as usize;
+            let value = if index + 1 < table.len() {
+                let fraction = (position - index as f64) as f32;
+                table[index] + (table[index + 1] - table[index]) * fraction
+            } else {
+                0.0
+            };
+            *coefficient = value;
+            sum += f64::from(value);
+        }
+        if sum.abs() > f64::EPSILON {
+            let gain = (1.0 / sum) as f32;
+            for coefficient in coefficients.iter_mut() {
+                *coefficient *= gain;
+            }
+        }
+    }
+}
+
+/// Scale `values` to unit sum (unity DC gain for every phase) into `out`.
+fn normalise_into(values: &[f64], sum: f64, out: &mut [f32]) {
+    let gain = if sum.abs() > f64::EPSILON {
+        1.0 / sum
+    } else {
+        1.0
+    };
+    for (destination, value) in out.iter_mut().zip(values) {
+        *destination = (value * gain) as f32;
+    }
+}
+
+/// Zeroth-order modified Bessel function of the first kind (power series).
+fn bessel_i0(x: f64) -> f64 {
+    let half = x / 2.0;
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    for k in 1..200 {
+        let factor = half / k as f64;
+        term *= factor * factor;
+        sum += term;
+        if term < sum * 1.0e-17 {
+            break;
+        }
+    }
+    sum
+}
+
+/// Best rational approximation `num / den` of `value` with `den <= max_den`,
+/// returned only when it equals `value` to within f64 rounding.
+fn exact_ratio(value: f64, max_den: u64) -> Option<(u64, u64)> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let (mut h0, mut h1) = (0_u64, 1_u64);
+    let (mut k0, mut k1) = (1_u64, 0_u64);
+    let mut remainder = value;
+    for _ in 0..64 {
+        let whole = remainder.floor();
+        if whole > 1.0e15 {
+            return None;
+        }
+        let a = whole as u64;
+        let h2 = a.checked_mul(h1)?.checked_add(h0)?;
+        let k2 = a.checked_mul(k1)?.checked_add(k0)?;
+        if k2 > max_den {
+            return None;
+        }
+        if ((h2 as f64 / k2 as f64) - value).abs() <= value * 4.0 * f64::EPSILON {
+            return (h2 > 0).then_some((h2, k2));
+        }
+        let fraction = remainder - whole;
+        if fraction <= 0.0 {
+            return None;
+        }
+        remainder = 1.0 / fraction;
+        (h0, h1) = (h1, h2);
+        (k0, k1) = (k1, k2);
+    }
+    None
+}
+
+/// Unrolled dot product (independent accumulators so it vectorises).
+fn dot(coefficients: &[f32], input: &[f32]) -> f32 {
+    let mut lanes = [0.0_f32; 8];
+    let coefficient_chunks = coefficients.chunks_exact(8);
+    let input_chunks = input.chunks_exact(8);
+    let tail = coefficient_chunks
+        .remainder()
+        .iter()
+        .zip(input_chunks.remainder())
+        .map(|(c, x)| c * x)
+        .sum::<f32>();
+    for (c, x) in coefficient_chunks.zip(input_chunks) {
+        for ((lane, &coefficient), &sample) in lanes.iter_mut().zip(c).zip(x) {
+            *lane += coefficient * sample;
+        }
+    }
+    lanes.iter().sum::<f32>() + tail
+}
+
+/// Band-limited resampling of interleaved audio with a Kaiser-windowed sinc
+/// filter (~100 dB stopband, passband to 90% of the lower Nyquist frequency).
+///
+/// Output frame `n` is centred exactly on input position `n * step` (the
+/// kernel is symmetric, so there is no group delay to compensate); input
+/// outside the buffer is treated as silence. Exact rational steps with up to
+/// `RESAMPLE_MAX_EXACT_PHASES` phases use a precomputed polyphase bank;
+/// other steps interpolate a finely sampled kernel table.
+fn resample_interleaved(
+    input: &[f32],
+    channels: usize,
+    step: ResampleStep,
+    out_frames: usize,
+) -> Result<Vec<f32>> {
+    let frames = input.len() / channels;
+    let kernel = SincKernel::new(step.value())?;
+    let radius = kernel.radius;
+    let taps = kernel.taps();
+
+    // Deinterleave into zero-padded planes so every tap window is in bounds:
+    // input frame `f` lives at plane index `f + radius`.
+    let too_large = || anyhow::anyhow!("resampled audio is too large");
+    let plane_len = frames
+        .checked_add(radius.checked_mul(2).ok_or_else(too_large)?)
+        .and_then(|len| len.checked_add(2))
+        .ok_or_else(too_large)?;
+    let mut planes = Vec::with_capacity(channels);
+    for _ in 0..channels {
+        planes.push(zeroed_samples(plane_len, "resampler input")?);
+    }
+    for (frame_index, frame) in input.chunks_exact(channels).enumerate() {
+        for (plane, &sample) in planes.iter_mut().zip(frame) {
+            plane[radius + frame_index] = sample;
+        }
+    }
+
+    let output_len = out_frames.checked_mul(channels).ok_or_else(too_large)?;
+    let mut output = zeroed_samples(output_len, "resampled output")?;
+
+    let bank = match step {
+        ResampleStep::Ratio { num: _, den }
+            if den <= RESAMPLE_MAX_EXACT_PHASES
+                && (den as usize)
+                    .checked_mul(taps)
+                    .is_some_and(|size| size <= RESAMPLE_MAX_BANK) =>
+        {
+            let phases = den as usize;
+            let mut bank = zeroed_samples(phases * taps, "resampler filter bank")?;
+            for (phase, coefficients) in bank.chunks_exact_mut(taps).enumerate() {
+                kernel.fill_exact(phase as f64 / den as f64, coefficients);
+            }
+            Some(bank)
+        }
+        _ => None,
+    };
+    let table = if bank.is_none() {
+        kernel.table()
+    } else {
+        Vec::new()
+    };
+    let mut scratch = vec![0.0_f32; taps];
+
+    // Exact position tracking for rational steps: input frame `index` plus
+    // `numerator / den` of a frame.
+    let (step_whole, step_fraction, den) = match step {
+        ResampleStep::Ratio { num, den } => ((num / den) as usize, num % den, den),
+        ResampleStep::Real(_) => (0, 0, 1),
+    };
+    let mut index = 0_usize;
+    let mut numerator = 0_u64;
+
+    for (out_index, out_frame) in output.chunks_exact_mut(channels).enumerate() {
+        let (frame, coefficients): (usize, &[f32]) = match (step, &bank) {
+            (ResampleStep::Ratio { .. }, Some(bank)) => {
+                let phase = numerator as usize;
+                (index, &bank[phase * taps..(phase + 1) * taps])
+            }
+            (ResampleStep::Ratio { .. }, None) => {
+                kernel.fill_from_table(&table, numerator as f64 / den as f64, &mut scratch);
+                (index, &scratch)
+            }
+            (ResampleStep::Real(step), _) => {
+                let position = out_index as f64 * step;
+                let whole = position.floor();
+                kernel.fill_from_table(&table, position - whole, &mut scratch);
+                (whole as usize, &scratch)
+            }
+        };
+        // Positions past the end only see padding; clamp to stay in bounds.
+        let start = frame.min(frames) + 1;
+        for (sample, plane) in out_frame.iter_mut().zip(&planes) {
+            *sample = dot(coefficients, &plane[start..start + taps]);
+        }
+
+        numerator += step_fraction;
+        if numerator >= den {
+            numerator -= den;
+            index = index.saturating_add(1);
+        }
+        index = index.saturating_add(step_whole);
+    }
+    Ok(output)
+}
+
+fn pad(audio: &mut AudioBuffer, start_sec: f32, end_sec: f32) -> Result<()> {
+    ensure_duration(start_sec, "pad start")?;
+    ensure_duration(end_sec, "pad end")?;
+
     let channels = usize::from(audio.spec.channels);
-    let start_samples = seconds_to_frames(start_sec, audio.spec.sample_rate) * channels;
-    let end_samples = seconds_to_frames(end_sec, audio.spec.sample_rate) * channels;
-    let mut output = Vec::with_capacity(start_samples + audio.samples.len() + end_samples);
-    output.resize(start_samples, 0.0);
-    output.extend_from_slice(&audio.samples);
-    output.resize(output.len() + end_samples, 0.0);
+    let too_large = || anyhow::anyhow!("padded output is too large");
+    let start_samples = seconds_to_frames(start_sec, audio.spec.sample_rate)
+        .checked_mul(channels)
+        .ok_or_else(too_large)?;
+    let end_samples = seconds_to_frames(end_sec, audio.spec.sample_rate)
+        .checked_mul(channels)
+        .ok_or_else(too_large)?;
+    let total = start_samples
+        .checked_add(audio.samples.len())
+        .and_then(|total| total.checked_add(end_samples))
+        .ok_or_else(too_large)?;
+    let mut output = zeroed_samples(total, "padded output")?;
+    output[start_samples..start_samples + audio.samples.len()].copy_from_slice(&audio.samples);
     audio.samples = output;
     Ok(())
 }
 
 fn trim_silence(audio: &mut AudioBuffer, threshold_db: f32, min_duration_sec: f32) -> Result<()> {
-    if min_duration_sec < 0.0 {
-        bail!("silence minimum duration must be >= 0");
+    ensure_duration(min_duration_sec, "silence minimum duration")?;
+    if !threshold_db.is_finite() {
+        bail!("silence threshold must be a finite number of dB (got {threshold_db})");
     }
     if audio.samples.is_empty() {
         return Ok(());
@@ -893,8 +1251,11 @@ fn trim_silence(audio: &mut AudioBuffer, threshold_db: f32, min_duration_sec: f3
 }
 
 fn lowpass(audio: &mut AudioBuffer, hz: f32) -> Result<()> {
-    if hz <= 0.0 {
-        bail!("lowpass frequency must be > 0");
+    if !hz.is_finite() || hz <= 0.0 {
+        bail!("lowpass frequency must be finite and > 0 (got {hz})");
+    }
+    if audio.spec.sample_rate == 0 {
+        bail!("lowpass requires a non-zero sample rate");
     }
     let channels = usize::from(audio.spec.channels);
     let dt = 1.0 / audio.spec.sample_rate as f32;
@@ -913,8 +1274,11 @@ fn lowpass(audio: &mut AudioBuffer, hz: f32) -> Result<()> {
 }
 
 fn highpass(audio: &mut AudioBuffer, hz: f32) -> Result<()> {
-    if hz <= 0.0 {
-        bail!("highpass frequency must be > 0");
+    if !hz.is_finite() || hz <= 0.0 {
+        bail!("highpass frequency must be finite and > 0 (got {hz})");
+    }
+    if audio.spec.sample_rate == 0 {
+        bail!("highpass requires a non-zero sample rate");
     }
     let channels = usize::from(audio.spec.channels);
     let dt = 1.0 / audio.spec.sample_rate as f32;
@@ -1426,8 +1790,8 @@ fn zeroed_samples(length: usize, description: &str) -> Result<Vec<f32>> {
 }
 
 fn limiter(audio: &mut AudioBuffer, threshold: f32) -> Result<()> {
-    if !(0.0..=1.0).contains(&threshold) {
-        bail!("limiter threshold must be between 0 and 1");
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        bail!("limiter threshold must be between 0 and 1 (got {threshold})");
     }
     for sample in &mut audio.samples {
         *sample = sample.clamp(-threshold, threshold);
@@ -1435,42 +1799,131 @@ fn limiter(audio: &mut AudioBuffer, threshold: f32) -> Result<()> {
     Ok(())
 }
 
+/// Convert to `sample_rate` with the band-limited resampler. The output has
+/// `round(frames * new_rate / old_rate)` frames (at least one for non-empty
+/// input), is aligned sample-for-sample in time with the input, and is
+/// low-pass filtered at the lower of the two Nyquist frequencies.
 fn rate(audio: &mut AudioBuffer, sample_rate: u32) -> Result<()> {
     if sample_rate == 0 {
         bail!("sample rate must be > 0");
     }
-    if sample_rate == audio.spec.sample_rate || audio.samples.is_empty() {
-        audio.spec.sample_rate = sample_rate;
-        return Ok(());
-    }
-
     let channels = usize::from(audio.spec.channels);
-    let old_frames = audio.frames();
-    if old_frames <= 1 {
+    if sample_rate == audio.spec.sample_rate || audio.samples.is_empty() || channels == 0 {
         audio.spec.sample_rate = sample_rate;
         return Ok(());
     }
-
-    let ratio = sample_rate as f64 / audio.spec.sample_rate as f64;
-    let new_frames = ((old_frames as f64) * ratio).round().max(1.0) as usize;
-    let mut output = vec![0.0; new_frames * channels];
-
-    for new_frame in 0..new_frames {
-        let source_pos = new_frame as f64 / ratio;
-        let left = source_pos.floor() as usize;
-        let right = (left + 1).min(old_frames - 1);
-        let fraction = (source_pos - left as f64) as f32;
-
-        for channel in 0..channels {
-            let a = audio.samples[left * channels + channel];
-            let b = audio.samples[right * channels + channel];
-            output[new_frame * channels + channel] = a + (b - a) * fraction;
-        }
+    if audio.spec.sample_rate == 0 {
+        bail!("cannot resample audio whose sample rate is zero");
     }
 
+    let divisor = gcd(u64::from(audio.spec.sample_rate), u64::from(sample_rate));
+    let num = u64::from(audio.spec.sample_rate) / divisor;
+    let den = u64::from(sample_rate) / divisor;
+    let frames = audio.frames();
+    // round(frames * den / num) in exact integer arithmetic.
+    let out_frames =
+        (2 * frames as u128 * u128::from(den) + u128::from(num)) / (2 * u128::from(num));
+    let out_frames = usize::try_from(out_frames.max(1))
+        .map_err(|_| anyhow::anyhow!("resampled audio is too large"))?;
+    audio.samples = resample_interleaved(
+        &audio.samples,
+        channels,
+        ResampleStep::Ratio { num, den },
+        out_frames,
+    )?;
     audio.spec.sample_rate = sample_rate;
-    audio.samples = output;
     Ok(())
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Gain for the centre and surround channels in the ITU-R BS.775 stereo
+/// downmix: 1/sqrt(2), i.e. -3 dB.
+const DOWNMIX_MINUS_3DB: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// Mixing matrix used to convert `source` channels into `target` channels:
+/// `matrix[t][s]` is the gain of source channel `s` in target channel `t`.
+///
+/// Source layouts follow the default WAVE_FORMAT_EXTENSIBLE channel orders:
+///
+/// | channels | layout | order                         |
+/// |----------|--------|-------------------------------|
+/// | 4        | quad   | L R Ls Rs                     |
+/// | 5        | 5.0    | L R C Ls Rs                   |
+/// | 6        | 5.1    | L R C LFE Ls Rs               |
+/// | 8        | 7.1    | L R C LFE Lb Rb Ls Rs         |
+///
+/// Downmix to stereo uses the ITU-R BS.775 coefficients
+/// (`g = 1/sqrt(2)`, -3 dB; the LFE channel is dropped):
+///
+/// ```text
+/// L' = L + g*C + g*Ls (+ g*Lb for 7.1)
+/// R' = R + g*C + g*Rs (+ g*Rb for 7.1)
+/// ```
+///
+/// Downmix to mono is the average of that stereo downmix, `(L' + R') / 2`,
+/// which for stereo sources is the familiar `(L + R) / 2`. The coefficients
+/// are not renormalised, so a loud multichannel mix can exceed full scale
+/// (it is preserved in float and clamped when quantised to integers).
+///
+/// Other conversions keep the previous rules: mono is copied to every
+/// output channel, a downmix to mono from a layout without a defined mapping
+/// (3, 7 or more than 8 channels) averages all channels, and any other
+/// conversion maps each output channel to the source channel with the same
+/// index (the last source channel for indices past the end).
+pub(crate) fn channel_matrix(source: usize, target: usize) -> Vec<Vec<f32>> {
+    let g = DOWNMIX_MINUS_3DB;
+    let stereo: Option<[Vec<f32>; 2]> = match source {
+        2 => Some([vec![1.0, 0.0], vec![0.0, 1.0]]),
+        4 => Some([vec![1.0, 0.0, g, 0.0], vec![0.0, 1.0, 0.0, g]]),
+        5 => Some([vec![1.0, 0.0, g, g, 0.0], vec![0.0, 1.0, g, 0.0, g]]),
+        6 => Some([
+            vec![1.0, 0.0, g, 0.0, g, 0.0],
+            vec![0.0, 1.0, g, 0.0, 0.0, g],
+        ]),
+        8 => Some([
+            vec![1.0, 0.0, g, 0.0, g, 0.0, g, 0.0],
+            vec![0.0, 1.0, g, 0.0, 0.0, g, 0.0, g],
+        ]),
+        _ => None,
+    };
+    if source == target {
+        return (0..target)
+            .map(|t| {
+                (0..source)
+                    .map(|s| if s == t { 1.0 } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+    }
+    if source == 1 {
+        return vec![vec![1.0]; target];
+    }
+    match (target, stereo) {
+        (1, Some([left, right])) => {
+            vec![
+                left.iter()
+                    .zip(&right)
+                    .map(|(l, r)| (l + r) * 0.5)
+                    .collect(),
+            ]
+        }
+        (1, None) => vec![vec![1.0 / source as f32; source]],
+        (2, Some(stereo)) => stereo.into(),
+        _ => (0..target)
+            .map(|t| {
+                let nearest = t.min(source - 1);
+                (0..source)
+                    .map(|s| if s == nearest { 1.0 } else { 0.0 })
+                    .collect()
+            })
+            .collect(),
+    }
 }
 
 fn convert_channels(audio: &mut AudioBuffer, target_channels: u16) -> Result<()> {
@@ -1482,19 +1935,29 @@ fn convert_channels(audio: &mut AudioBuffer, target_channels: u16) -> Result<()>
     }
 
     let source_channels = usize::from(audio.spec.channels);
+    if source_channels == 0 {
+        bail!("cannot convert audio with zero channels");
+    }
     let target_channels_usize = usize::from(target_channels);
     let frames = audio.frames();
-    let mut output = Vec::with_capacity(frames * target_channels_usize);
+    let output_len = frames
+        .checked_mul(target_channels_usize)
+        .ok_or_else(|| anyhow::anyhow!("channel-converted audio is too large"))?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_len)
+        .context("not enough memory to convert channels")?;
 
+    let matrix = channel_matrix(source_channels, target_channels_usize);
     for frame in audio.samples.chunks_exact(source_channels) {
-        if target_channels == 1 {
-            output.push(frame.iter().sum::<f32>() / source_channels as f32);
-        } else if source_channels == 1 {
-            output.extend(std::iter::repeat_n(frame[0], target_channels_usize));
-        } else {
-            for channel in 0..target_channels_usize {
-                output.push(frame[channel.min(source_channels - 1)]);
-            }
+        for row in &matrix {
+            output.push(
+                row.iter()
+                    .zip(frame)
+                    .filter(|(gain, _)| **gain != 0.0)
+                    .map(|(gain, sample)| gain * sample)
+                    .sum::<f32>(),
+            );
         }
     }
 

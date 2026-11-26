@@ -1,4 +1,6 @@
+use crate::audio::quantize_pcm;
 use crate::cli::StreamArgs;
+use crate::io::TempOutput;
 use crate::limiter::{self, LoudnessGoal};
 use crate::loudness::{LoudnessMeter, LoudnessReport};
 use crate::util::seconds_to_frames;
@@ -13,8 +15,8 @@ pub fn stream_wav(args: &StreamArgs) -> Result<()> {
     if args.loudness_target.is_some() || args.true_peak.is_some() {
         return stream_loudness(args);
     }
-    if args.bits.is_some() || args.float || args.stat_json {
-        bail!("--bits, --float and --stat-json require --loudness-target or --true-peak");
+    if args.stat_json {
+        bail!("--stat-json requires --loudness-target or --true-peak");
     }
     if !(0.0..=1.0).contains(&args.limiter) {
         bail!("stream limiter must be between 0 and 1");
@@ -25,32 +27,23 @@ pub fn stream_wav(args: &StreamArgs) -> Result<()> {
         bail!("stream fade durations must be >= 0");
     }
 
-    let mut reader = WavReader::open(&args.input)
-        .with_context(|| format!("failed to open {}", args.input.display()))?;
-    let input_spec = reader.spec();
+    let (input_spec, duration) = {
+        let reader = WavReader::open(&args.input)
+            .with_context(|| format!("failed to open {}", args.input.display()))?;
+        (reader.spec(), reader.duration())
+    };
     if input_spec.channels == 0 {
         bail!("WAV file has zero channels");
     }
+    let (bits, float) = resolve_output_format(&input_spec, args)?;
 
-    let output_spec = WavSpec {
-        channels: input_spec.channels,
-        sample_rate: input_spec.sample_rate,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
-    if let Some(parent) = args
-        .output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let mut writer = WavWriter::create(&args.output, output_spec)
-        .with_context(|| format!("failed to create {}", args.output.display()))?;
+    // Declared before the sink so the writer is closed before a failed temp
+    // file is removed.
+    let temp = TempOutput::new(&args.output)?;
+    let mut sink = WavSink::create(temp.path(), &input_spec, bits, float)?;
 
-    let channels = u32::from(input_spec.channels);
-    let total_frames = reader.duration() / channels;
+    let channels = u64::from(input_spec.channels);
+    let total_frames = duration;
     let gain = args
         .gain_db
         .map(|db| 10.0_f32.powf(db / 20.0))
@@ -59,113 +52,53 @@ pub fn stream_wav(args: &StreamArgs) -> Result<()> {
         seconds_to_frames(args.fade_in.unwrap_or(0.0), input_spec.sample_rate) as u32;
     let fade_out_frames =
         seconds_to_frames(args.fade_out.unwrap_or(0.0), input_spec.sample_rate) as u32;
+    // Float output is never clamped; integer output clamps while quantizing.
+    let limiter = (args.limiter < 1.0).then_some(args.limiter);
 
-    match input_spec.sample_format {
-        SampleFormat::Float => stream_samples::<f32, _>(
-            reader.samples::<f32>(),
-            &mut writer,
-            StreamSettings {
-                channels,
-                total_frames,
-                gain,
-                fade_in_frames,
-                fade_out_frames,
-                limiter: args.limiter,
-            },
-            |value| value,
-        )?,
-        SampleFormat::Int => match input_spec.bits_per_sample {
-            0 => bail!("WAV file has zero bits per sample"),
-            1..=8 => {
-                let max = ((1_i32 << (input_spec.bits_per_sample - 1)) - 1) as f32;
-                stream_samples::<i8, _>(
-                    reader.samples::<i8>(),
-                    &mut writer,
-                    StreamSettings {
-                        channels,
-                        total_frames,
-                        gain,
-                        fade_in_frames,
-                        fade_out_frames,
-                        limiter: args.limiter,
-                    },
-                    |value| value as f32 / max,
-                )?
+    let mut sample_index: u64 = 0;
+    replay_wav(&args.input, &mut |chunk| {
+        for &sample in chunk {
+            let frame = (sample_index / channels) as u32;
+            sample_index += 1;
+            let mut value = sample * gain;
+            value *= fade_factor(frame, total_frames, fade_in_frames, fade_out_frames);
+            if let Some(limit) = limiter {
+                value = value.clamp(-limit, limit);
             }
-            9..=16 => {
-                let max = ((1_i32 << (input_spec.bits_per_sample - 1)) - 1) as f32;
-                stream_samples::<i16, _>(
-                    reader.samples::<i16>(),
-                    &mut writer,
-                    StreamSettings {
-                        channels,
-                        total_frames,
-                        gain,
-                        fade_in_frames,
-                        fade_out_frames,
-                        limiter: args.limiter,
-                    },
-                    |value| value as f32 / max,
-                )?
-            }
-            17..=32 => {
-                let max = ((1_i64 << (input_spec.bits_per_sample - 1)) - 1) as f32;
-                stream_samples::<i32, _>(
-                    reader.samples::<i32>(),
-                    &mut writer,
-                    StreamSettings {
-                        channels,
-                        total_frames,
-                        gain,
-                        fade_in_frames,
-                        fade_out_frames,
-                        limiter: args.limiter,
-                    },
-                    |value| value as f32 / max,
-                )?
-            }
-            bits => bail!("unsupported integer WAV depth: {bits}"),
-        },
-    }
+            sink.write_sample(value)?;
+        }
+        Ok(())
+    })?;
 
-    writer.finalize()?;
-    Ok(())
+    sink.finish()?;
+    temp.commit()
 }
 
-#[derive(Clone, Copy)]
-struct StreamSettings {
-    channels: u32,
-    total_frames: u32,
-    gain: f32,
-    fade_in_frames: u32,
-    fade_out_frames: u32,
-    limiter: f32,
-}
-
-fn stream_samples<T, F>(
-    samples: hound::WavSamples<'_, std::io::BufReader<std::fs::File>, T>,
-    writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>,
-    settings: StreamSettings,
-    to_f32: F,
-) -> Result<()>
-where
-    T: hound::Sample,
-    F: Fn(T) -> f32,
-{
-    for (sample_index, sample) in samples.enumerate() {
-        let frame = sample_index as u32 / settings.channels;
-        let mut value = to_f32(sample?) * settings.gain;
-        value *= fade_factor(
-            frame,
-            settings.total_frames,
-            settings.fade_in_frames,
-            settings.fade_out_frames,
-        );
-        value = value.clamp(-settings.limiter, settings.limiter);
-        writer.write_sample((value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)?;
+/// Output depth and sample format: explicit `--bits` / `--float`, otherwise
+/// the input's own depth (rounded up to a supported size) and sample format.
+fn resolve_output_format(input: &WavSpec, args: &StreamArgs) -> Result<(u16, bool)> {
+    let (bits, float) = match (args.bits, args.float) {
+        (None, false) => {
+            if input.sample_format == SampleFormat::Float {
+                (32, true)
+            } else {
+                let bits = match input.bits_per_sample {
+                    0 => bail!("WAV file has zero bits per sample"),
+                    1..=8 => 8,
+                    9..=16 => 16,
+                    17..=24 => 24,
+                    _ => 32,
+                };
+                (bits, false)
+            }
+        }
+        (None, true) => (32, true),
+        (Some(bits), float) => (bits, float),
+    };
+    if !matches!(bits, 8 | 16 | 24 | 32) || (float && bits != 32) {
+        bail!("WAV output requires 8, 16, 24, or 32 bits; float requires 32 bits");
     }
-
-    Ok(())
+    Ok((bits, float))
 }
 
 fn fade_factor(frame: u32, total_frames: u32, fade_in_frames: u32, fade_out_frames: u32) -> f32 {
@@ -184,8 +117,9 @@ fn fade_factor(frame: u32, total_frames: u32, fade_in_frames: u32, fade_out_fram
 }
 
 /// Stream a WAV file as chunks of whole interleaved `f32` frames. Integer
-/// samples are scaled to [-1, 1) and float samples are clamped, exactly like
-/// the in-memory reader, so streaming and in-memory results agree.
+/// samples are scaled to [-1, 1) like the in-memory reader. Float samples are
+/// passed through unclamped (clamping happens only at integer quantization);
+/// NaN and infinite samples are an error.
 pub fn replay_wav(path: &Path, emit: &mut dyn FnMut(&[f32]) -> Result<()>) -> Result<()> {
     let mut reader =
         WavReader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -195,9 +129,7 @@ pub fn replay_wav(path: &Path, emit: &mut dyn FnMut(&[f32]) -> Result<()>) -> Re
     }
     let chunk = CHUNK_FRAMES * usize::from(spec.channels);
     match spec.sample_format {
-        SampleFormat::Float => {
-            replay_samples(reader.samples::<f32>(), chunk, |v| v.clamp(-1.0, 1.0), emit)
-        }
+        SampleFormat::Float => replay_samples(reader.samples::<f32>(), chunk, |v| v, emit),
         SampleFormat::Int => {
             let scale = match spec.bits_per_sample {
                 0 => bail!("WAV file has zero bits per sample"),
@@ -231,7 +163,11 @@ fn replay_samples<T>(
 ) -> Result<()> {
     let mut buffer = Vec::with_capacity(chunk);
     for sample in samples {
-        buffer.push(convert(sample?));
+        let value = convert(sample?);
+        if !value.is_finite() {
+            bail!("WAV file contains a NaN or infinite sample");
+        }
+        buffer.push(value);
         if buffer.len() == chunk {
             emit(&buffer)?;
             buffer.clear();
@@ -260,18 +196,51 @@ struct WavSink {
 }
 
 impl WavSink {
-    fn write(&mut self, samples: &[f32]) -> Result<()> {
+    fn create(path: &Path, input: &WavSpec, bits: u16, float: bool) -> Result<Self> {
+        let writer = WavWriter::create(
+            path,
+            WavSpec {
+                channels: input.channels,
+                sample_rate: input.sample_rate,
+                bits_per_sample: bits,
+                sample_format: if float {
+                    SampleFormat::Float
+                } else {
+                    SampleFormat::Int
+                },
+            },
+        )
+        .with_context(|| format!("failed to create {}", path.display()))?;
+        Ok(Self {
+            writer,
+            bits,
+            float,
+        })
+    }
+
+    fn write_sample(&mut self, sample: f32) -> Result<()> {
         if self.float {
-            for &sample in samples {
-                self.writer.write_sample(sample)?;
-            }
+            self.writer.write_sample(sample)?;
         } else {
-            let scale = ((1_u64 << (self.bits - 1)) - 1) as f32;
-            for &sample in samples {
-                let value = (sample.clamp(-1.0, 1.0) * scale).round() as i32;
-                self.writer.write_sample(value)?;
+            let value = quantize_pcm(sample, u32::from(self.bits)) as i32;
+            match self.bits {
+                8 => self.writer.write_sample(value as i8)?,
+                16 => self.writer.write_sample(value as i16)?,
+                _ => self.writer.write_sample(value)?,
             }
         }
+        Ok(())
+    }
+
+    fn write(&mut self, samples: &[f32]) -> Result<()> {
+        for &sample in samples {
+            self.write_sample(sample)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        self.writer.finalize()?;
         Ok(())
     }
 }
@@ -291,44 +260,11 @@ fn stream_loudness(args: &StreamArgs) -> Result<()> {
     if input_spec.channels == 0 {
         bail!("WAV file has zero channels");
     }
-    let (bits, float) = match (args.bits, args.float) {
-        (None, false) => (
-            input_spec.bits_per_sample,
-            input_spec.sample_format == SampleFormat::Float,
-        ),
-        (None, true) => (32, true),
-        (Some(bits), float) => (bits, float),
-    };
-    if !matches!(bits, 8 | 16 | 24 | 32) || (float && bits != 32) {
-        bail!("WAV output requires 8, 16, 24, or 32 bits; float requires 32 bits");
-    }
-    if let Some(parent) = args
-        .output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let writer = WavWriter::create(
-        &args.output,
-        WavSpec {
-            channels: input_spec.channels,
-            sample_rate: input_spec.sample_rate,
-            bits_per_sample: bits,
-            sample_format: if float {
-                SampleFormat::Float
-            } else {
-                SampleFormat::Int
-            },
-        },
-    )
-    .with_context(|| format!("failed to create {}", args.output.display()))?;
-    let mut sink = WavSink {
-        writer,
-        bits,
-        float,
-    };
+    let (bits, float) = resolve_output_format(&input_spec, args)?;
+    // Declared before the sink so the writer is closed before a failed temp
+    // file is removed.
+    let temp = TempOutput::new(&args.output)?;
+    let mut sink = WavSink::create(temp.path(), &input_spec, bits, float)?;
 
     let input = args.input.clone();
     let outcome = limiter::normalize(
@@ -339,7 +275,8 @@ fn stream_loudness(args: &StreamArgs) -> Result<()> {
         args.stat_json,
         &mut |chunk: &[f32]| sink.write(chunk),
     )?;
-    sink.writer.finalize()?;
+    sink.finish()?;
+    temp.commit()?;
 
     if args.loudness_target.is_some() && outcome.input.integrated_lufs.is_none() {
         eprintln!("warning: input is silent (below the -70 LUFS gate); no gain applied");

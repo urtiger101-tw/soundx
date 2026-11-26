@@ -6,6 +6,7 @@ use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, Error as AacError};
 use rusty_flac::Encoder as FlacEncoder;
 use rusty_mp3::{Error as Mp3Error, Mp3Encoder, Mp3EncoderConfig};
 use rusty_vorbis::{Error as VorbisError, VorbisEncoder, VorbisEncoderConfig};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -201,8 +202,9 @@ fn write_wav_float64(audio: &AudioBuffer, output: &Path) -> Result<()> {
 fn write_raw(audio: &AudioBuffer, output: &Path, encoding: RawEncoding) -> Result<()> {
     validate_audio(audio)?;
     let mut file = BufWriter::new(File::create(output)?);
+    // Integer encodings clamp inside `quantize_pcm`; float encodings keep values
+    // above full scale.
     for &sample in &audio.samples {
-        let sample = sample.clamp(-1.0, 1.0);
         match encoding {
             RawEncoding::PcmU8 => write_raw_unsigned(&mut file, sample, 1, false)?,
             RawEncoding::PcmU16le => write_raw_unsigned(&mut file, sample, 2, false)?,
@@ -321,7 +323,11 @@ fn write_mp3(audio: &AudioBuffer, output: &Path, bitrate_kbps: u32) -> Result<()
         vbr_quality: None,
     });
     encoder
-        .push_pcm_f32(&audio.samples, audio.spec.channels, audio.spec.sample_rate)
+        .push_pcm_f32(
+            &normalized_pcm(&audio.samples),
+            audio.spec.channels,
+            audio.spec.sample_rate,
+        )
         .context("MP3 encoder rejected the stream format")?;
     encoder.finish();
 
@@ -344,7 +350,11 @@ fn write_vorbis(audio: &AudioBuffer, output: &Path) -> Result<()> {
     }
     let mut encoder = VorbisEncoder::new(VorbisEncoderConfig::default());
     encoder
-        .push_pcm_f32(&audio.samples, audio.spec.channels, audio.spec.sample_rate)
+        .push_pcm_f32(
+            &normalized_pcm(&audio.samples),
+            audio.spec.channels,
+            audio.spec.sample_rate,
+        )
         .context("Vorbis encoder rejected the stream format")?;
     encoder.finish();
 
@@ -392,7 +402,11 @@ fn write_aac(audio: &AudioBuffer, output: &Path, bitrate_kbps: u32) -> Result<()
         ..AacEncoderConfig::default()
     });
     encoder
-        .push_pcm(&audio.samples, audio.spec.channels, audio.spec.sample_rate)
+        .push_pcm(
+            &normalized_pcm(&audio.samples),
+            audio.spec.channels,
+            audio.spec.sample_rate,
+        )
         .context("AAC encoder rejected the stream format")?;
     encoder.finish();
 
@@ -566,20 +580,24 @@ fn encode_alaw(sample: i16) -> u8 {
 }
 
 fn validate_audio(audio: &AudioBuffer) -> Result<()> {
-    if audio.spec.channels == 0 || audio.spec.sample_rate == 0 {
-        bail!("audio stream must have at least one channel and a non-zero sample rate");
+    audio.validate()
+}
+
+/// Samples for encoders whose input contract is normalized PCM in [-1, 1]
+/// (the MP3, Vorbis and AAC encoders scale by 32768 internally and are only
+/// specified for that range). Borrows the buffer when nothing exceeds full
+/// scale; otherwise returns a clamped copy.
+fn normalized_pcm(samples: &[f32]) -> Cow<'_, [f32]> {
+    if samples.iter().all(|sample| (-1.0..=1.0).contains(sample)) {
+        Cow::Borrowed(samples)
+    } else {
+        Cow::Owned(
+            samples
+                .iter()
+                .map(|sample| sample.clamp(-1.0, 1.0))
+                .collect(),
+        )
     }
-    if !audio
-        .samples
-        .len()
-        .is_multiple_of(usize::from(audio.spec.channels))
-    {
-        bail!("interleaved sample count is not divisible by the channel count");
-    }
-    if audio.samples.iter().any(|sample| !sample.is_finite()) {
-        bail!("audio stream contains NaN or infinite samples");
-    }
-    Ok(())
 }
 
 fn stream_serial() -> u32 {

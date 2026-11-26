@@ -15,7 +15,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
                 effects.push(Effect::GainDb(db));
             }
             "norm" | "normalize" => {
-                let target_db = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let target_db = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         value
@@ -26,7 +26,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "trim" => {
                 let start = parse_next_f32(tokens, &mut i, "trim requires <start-sec>")?;
-                let duration = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let duration = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         Some(value)
@@ -40,7 +40,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "fade" => {
                 let in_sec = parse_next_f32(tokens, &mut i, "fade requires <in-sec>")?;
-                let out_sec = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let out_sec = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         value
@@ -123,6 +123,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
                         .get(i + 1)
                         .ok_or_else(|| anyhow!("compand requires <attack,decay,...>"))?,
                     "compand attack/decay values",
+                    false,
                 )?;
                 i += 1;
                 if attack_values.is_empty() || attack_values.len() % 2 != 0 {
@@ -137,12 +138,12 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
                     .ok_or_else(|| anyhow!("compand requires <transfer-points>"))?;
                 let (knee_db, transfer_token) = match transfer_token.split_once(':') {
                     Some((knee, points)) => {
-                        (knee.parse::<f32>().context("invalid compand knee")?, points)
+                        (parse_finite(knee).context("invalid compand knee")?, points)
                     }
                     None => (0.0, transfer_token.as_str()),
                 };
                 let transfer_values =
-                    parse_comma_floats(transfer_token, "compand transfer points")?;
+                    parse_comma_floats(transfer_token, "compand transfer points", true)?;
                 i += 1;
                 if transfer_values.len() < 4 || transfer_values.len() % 2 != 0 {
                     return Err(anyhow!(
@@ -195,7 +196,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "pad" => {
                 let start_sec = parse_next_f32(tokens, &mut i, "pad requires <start-sec>")?;
-                let end_sec = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let end_sec = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         value
@@ -207,7 +208,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             "silence" => {
                 let threshold_db =
                     parse_next_f32(tokens, &mut i, "silence requires <threshold-db>")?;
-                let min_duration_sec = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let min_duration_sec = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         value
@@ -335,7 +336,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
                 let output_gain = parse_next_f32(tokens, &mut i, "echo requires <gain-out>")?;
                 let mut taps_ms = Vec::new();
                 loop {
-                    let Some(delay) = tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) else {
+                    let Some(delay) = tokens.get(i + 1).and_then(|s| finite(s)) else {
                         break;
                     };
                     i += 1;
@@ -355,7 +356,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "tremolo" => {
                 let speed_hz = parse_next_f32(tokens, &mut i, "tremolo requires <speed-hz>")?;
-                let depth_percent = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let depth_percent = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         value
@@ -369,11 +370,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "delay" => {
                 let mut delays_sec = Vec::new();
-                while tokens
-                    .get(i + 1)
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .is_some()
-                {
+                while tokens.get(i + 1).and_then(|s| finite(s)).is_some() {
                     delays_sec.push(parse_next_f32(
                         tokens,
                         &mut i,
@@ -387,7 +384,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "dcshift" => {
                 let shift = parse_next_f32(tokens, &mut i, "dcshift requires <shift>")?;
-                let limiter_gain = tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok());
+                let limiter_gain = tokens.get(i + 1).and_then(|s| finite(s));
                 if limiter_gain.is_some() {
                     i += 1;
                 }
@@ -428,7 +425,7 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
             }
             "swap" => effects.push(Effect::Swap),
             "limiter" => {
-                let threshold = match tokens.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                let threshold = match tokens.get(i + 1).and_then(|s| finite(s)) {
                     Some(value) => {
                         i += 1;
                         value
@@ -458,6 +455,19 @@ pub fn parse_effects(tokens: &[String]) -> Result<(Vec<Effect>, bool)> {
     Ok((effects, stat_json))
 }
 
+/// Parse a float, rejecting NaN and infinities.
+fn parse_finite(value: &str) -> Result<f32> {
+    let parsed = value.parse::<f32>()?;
+    if !parsed.is_finite() {
+        return Err(anyhow!("{value} is not a finite number"));
+    }
+    Ok(parsed)
+}
+
+fn finite(value: &str) -> Option<f32> {
+    parse_finite(value).ok()
+}
+
 fn parse_next_frequency(tokens: &[String], i: &mut usize, message: &str) -> Result<f32> {
     *i += 1;
     tokens
@@ -467,17 +477,24 @@ fn parse_next_frequency(tokens: &[String], i: &mut usize, message: &str) -> Resu
 }
 
 fn take_optional_f32(tokens: &[String], i: &mut usize) -> Option<f32> {
-    let value = tokens.get(*i + 1)?.parse::<f32>().ok()?;
+    let value = finite(tokens.get(*i + 1)?)?;
     *i += 1;
     Some(value)
 }
 
-fn parse_comma_floats(value: &str, name: &str) -> Result<Vec<f32>> {
+/// Parse comma-separated floats. NaN is always rejected; infinities are
+/// accepted only when `allow_infinite` (SoX compand transfer curves use -inf).
+fn parse_comma_floats(value: &str, name: &str, allow_infinite: bool) -> Result<Vec<f32>> {
     value
         .split(',')
         .map(|part| {
-            part.parse::<f32>()
-                .with_context(|| format!("invalid {name}: '{part}'"))
+            let parsed = part
+                .parse::<f32>()
+                .with_context(|| format!("invalid {name}: '{part}'"))?;
+            if parsed.is_nan() || (!allow_infinite && parsed.is_infinite()) {
+                return Err(anyhow!("invalid {name}: '{part}' is not a finite number"));
+            }
+            Ok(parsed)
         })
         .collect()
 }
@@ -535,8 +552,8 @@ fn parse_next_f32(tokens: &[String], i: &mut usize, message: &str) -> Result<f32
     *i += 1;
     tokens
         .get(*i)
-        .ok_or_else(|| anyhow!(message.to_string()))?
-        .parse::<f32>()
+        .ok_or_else(|| anyhow!(message.to_string()))
+        .and_then(|token| parse_finite(token))
         .with_context(|| message.to_string())
 }
 
