@@ -648,10 +648,14 @@ pub fn run(args: IntegrationArgs) -> Result<()> {
 mod tests {
     use super::*;
     fn root() -> PathBuf {
+        // The clock alone is not unique across parallel tests (macOS has
+        // microsecond resolution), so add a per-process counter.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "soundx-integration-test-{}-{}",
+            "soundx-integration-test-{}-{}-{}",
             std::process::id(),
-            nonce().unwrap()
+            nonce().unwrap(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         path
