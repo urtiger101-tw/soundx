@@ -17,7 +17,7 @@ mod synth;
 mod util;
 mod windows_audio;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use audio::AudioBuffer;
 use clap::Parser;
 use cli::{
@@ -189,7 +189,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         }
         None => None,
     };
-    encode::write_audio_with_options(
+    io::write_audio_atomic(
         &audio,
         &args.output,
         encode::EncodeOptions {
@@ -255,16 +255,18 @@ fn run_batch(args: BatchArgs) -> Result<()> {
         bail!("no input files matched");
     }
 
+    let chain = args.effect_chain()?;
+    let extension = args.ext.trim_start_matches('.').to_string();
+    let outputs = io::plan_batch_outputs(&inputs, &args.out_dir, &extension)?;
+
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("failed to create {}", args.out_dir.display()))?;
 
-    let chain = args.effect_chain()?;
-    let extension = args.ext.trim_start_matches('.').to_string();
     let failures: Vec<_> = inputs
         .par_iter()
-        .filter_map(|input| {
-            let output = io::output_for_batch(input, &args.out_dir, &extension);
-            io::convert_one(input, &output, &chain, args.stat_json)
+        .zip(outputs.par_iter())
+        .filter_map(|(input, output)| {
+            io::convert_one(input, output, &chain, args.stat_json)
                 .err()
                 .map(|err| format!("{}: {err:#}", input.display()))
         })
@@ -296,10 +298,12 @@ fn run_plan(args: RunPlanArgs) -> Result<()> {
 
     match plan.mode {
         PlanMode::Convert => {
-            let input = plan
-                .inputs
-                .first()
-                .ok_or_else(|| anyhow!("convert plan requires at least one input"))?;
+            let [input] = plan.inputs.as_slice() else {
+                bail!(
+                    "convert plan requires exactly one input, found {}",
+                    plan.inputs.len()
+                );
+            };
             io::convert_one(input, &plan.output, &chain, stat_json)
         }
         PlanMode::Concat => {

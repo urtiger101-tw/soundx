@@ -245,7 +245,35 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 fn nonce() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())
 }
+/// Follow symlinks to the final path (relative targets resolve against the
+/// link's directory). A dangling link yields the path it points at, so the
+/// file is created there and the link survives.
+fn resolve_link(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .map_or_else(|| target.clone(), |parent| parent.join(&target))
+        };
+    }
+    current
+}
+/// Write through symlinks: temp file + rename happen next to the real target,
+/// so a symlinked config stays a symlink.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let path = &resolve_link(path);
     let parent = path.parent().context("missing parent directory")?;
     std::fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(".soundx-{}-{}.tmp", std::process::id(), nonce()?));
@@ -273,6 +301,31 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("failed to update {}", path.display()))
 }
 
+const KEEP_BACKUPS: usize = 5;
+/// Keep only the newest backups per agent; they can contain credentials.
+fn prune_backups(home: &Path, agent: &str) {
+    let directory = home.join(".soundx/backups");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return;
+    };
+    let prefix = format!("{agent}-");
+    let mut backups: Vec<(u128, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".bak")?;
+            stem.strip_prefix(&prefix)?;
+            let stamp = stem.rsplit('-').next()?.parse().ok()?;
+            Some((stamp, entry.path()))
+        })
+        .collect();
+    backups.sort();
+    let excess = backups.len().saturating_sub(KEEP_BACKUPS);
+    for (_, path) in backups.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 struct Change {
     path: PathBuf,
     before: Option<Vec<u8>>,
@@ -291,6 +344,7 @@ fn apply(changes: &[Change]) -> Result<()> {
                 Some(bytes) => write_atomic(&change.path, bytes),
                 None => {
                     if change.before.is_some() {
+                        // `remove_file` removes a symlink itself, never its target.
                         std::fs::remove_file(&change.path)?;
                     }
                     Ok(())
@@ -307,7 +361,8 @@ fn apply(changes: &[Change]) -> Result<()> {
                     if let Some(bytes) = &previous.before {
                         write_atomic(&previous.path, bytes)?;
                     } else if previous.after.is_some() {
-                        std::fs::remove_file(&previous.path)?;
+                        // We created the (possibly link-resolved) file; remove that one.
+                        std::fs::remove_file(resolve_link(&previous.path))?;
                     }
                     Ok(())
                 })();
@@ -416,6 +471,7 @@ fn install(home: &Path, agent: AgentTarget, executable: &Path) -> Result<Value> 
         after: Some(serde_json::to_vec_pretty(&record)?),
     });
     apply(&changes)?;
+    prune_backups(home, layout.name);
     Ok(
         json!({"agent":layout.name,"status":"installed","config":layout.config,"skills":layout.skills,"backup":backup,"restart_agent":true}),
     )
@@ -501,6 +557,7 @@ fn remove_owned(home: &Path, agent: AgentTarget, executable: Option<&Path>) -> R
         });
     }
     apply(&changes)?;
+    prune_backups(home, layout.name);
     for path in &layout.skills {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir(parent);
@@ -511,7 +568,8 @@ fn remove_owned(home: &Path, agent: AgentTarget, executable: Option<&Path>) -> R
     )
 }
 
-fn home_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
+/// `create` is only for install; list/remove must not invent directories.
+fn home_path(override_path: Option<PathBuf>, create: bool) -> Result<PathBuf> {
     let path = override_path
         .or_else(|| {
             std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
@@ -522,14 +580,18 @@ fn home_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    std::fs::create_dir_all(&path)?;
+    if create {
+        std::fs::create_dir_all(&path)?;
+    } else if !path.is_dir() {
+        bail!("integration home does not exist: {}", path.display());
+    }
     std::fs::canonicalize(path).context("could not resolve integration home")
 }
 
 pub fn run(args: IntegrationArgs) -> Result<()> {
     let value = match args.command {
         IntegrationCommand::List { home } => {
-            let home = home_path(home)?;
+            let home = home_path(home, false)?;
             let mut targets = Vec::new();
             for agent in TARGETS {
                 let layout = layout(&home, agent)?;
@@ -538,7 +600,7 @@ pub fn run(args: IntegrationArgs) -> Result<()> {
             json!(targets)
         }
         IntegrationCommand::Install { agent, home } => {
-            install(&home_path(home)?, agent, &std::env::current_exe()?)?
+            install(&home_path(home, true)?, agent, &std::env::current_exe()?)?
         }
         IntegrationCommand::Remove {
             agent,
@@ -546,7 +608,7 @@ pub fn run(args: IntegrationArgs) -> Result<()> {
             only_executable,
             home,
         } => {
-            let home = home_path(home)?;
+            let home = home_path(home, false)?;
             if all {
                 let mut results = Vec::new();
                 for agent in TARGETS {
@@ -586,10 +648,14 @@ pub fn run(args: IntegrationArgs) -> Result<()> {
 mod tests {
     use super::*;
     fn root() -> PathBuf {
+        // The clock alone is not unique across parallel tests (macOS has
+        // microsecond resolution), so add a per-process counter.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "soundx-integration-test-{}-{}",
+            "soundx-integration-test-{}-{}-{}",
             std::process::id(),
-            nonce().unwrap()
+            nonce().unwrap(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         path
@@ -742,5 +808,152 @@ mod tests {
         assert_eq!(std::fs::read(first).unwrap(), b"original");
         assert_eq!(std::fs::read(second).unwrap(), b"concurrent change");
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn symlinked_config_stays_a_link_and_target_is_updated() {
+        let home = root();
+        let agent = AgentTarget::Claude;
+        let layout = layout(&home, agent).unwrap();
+        let repo = home.join("dotfiles");
+        std::fs::create_dir(&repo).unwrap();
+        let target = repo.join("claude.json");
+        std::fs::write(&target, "{\"theme\":\"dark\"}").unwrap();
+        // Relative link target, as dotfile managers commonly create.
+        if !try_symlink(&Path::new("dotfiles").join("claude.json"), &layout.config) {
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        install(&home, agent, &home.join("soundx.exe")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&layout.config)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.contains("theme") && text.contains("soundx"));
+        assert_eq!(remove(&home, agent).unwrap()["status"], "removed");
+        assert!(
+            std::fs::symlink_metadata(&layout.config)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!std::fs::read_to_string(&target).unwrap().contains("soundx"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn dangling_symlink_is_created_in_place_and_kept() {
+        let home = root();
+        let target = home.join("dotfiles/new.json");
+        let link = home.join("link.json");
+        if !try_symlink(&Path::new("dotfiles").join("new.json"), &link) {
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        write_atomic(&link, b"hello").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn removing_a_symlinked_skill_removes_only_the_link() {
+        let home = root();
+        let agent = AgentTarget::Claude;
+        let layout = layout(&home, agent).unwrap();
+        install(&home, agent, &home.join("soundx.exe")).unwrap();
+        let skill = &layout.skills[0];
+        let kept = home.join("kept-skill.md");
+        std::fs::write(&kept, SKILL).unwrap();
+        std::fs::remove_file(skill).unwrap();
+        if !try_symlink(&kept, skill) {
+            std::fs::remove_dir_all(home).unwrap();
+            return;
+        }
+        assert_eq!(remove(&home, agent).unwrap()["status"], "removed");
+        assert!(std::fs::symlink_metadata(skill).is_err());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), SKILL);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    /// Create a file symlink; false when the platform denies it (Windows
+    /// without privilege), so the test is skipped gracefully.
+    fn try_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+        match result {
+            Ok(()) => true,
+            Err(error) if cfg!(windows) => {
+                eprintln!("skipping symlink test: {error}");
+                false
+            }
+            Err(error) => panic!("symlink failed: {error}"),
+        }
+    }
+    #[test]
+    fn only_newest_backups_are_kept_per_agent() {
+        let home = root();
+        let backups = home.join(".soundx/backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        for stamp in 1..=9u32 {
+            for name in ["claude", "claude-remove", "codex"] {
+                std::fs::write(backups.join(format!("{name}-{stamp:03}.bak")), "x").unwrap();
+            }
+        }
+        std::fs::write(backups.join("claude-notes.txt"), "keep").unwrap();
+        prune_backups(&home, "claude");
+        let names = |prefix: &str| {
+            let mut found: Vec<String> = std::fs::read_dir(&backups)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.starts_with(prefix) && name.ends_with(".bak"))
+                .collect();
+            found.sort();
+            found
+        };
+        // claude- and claude-remove- share one budget of five (newest wins).
+        assert_eq!(names("claude-").len(), 5);
+        assert!(names("claude-").iter().all(|n| {
+            ["007.bak", "008.bak", "009.bak"]
+                .iter()
+                .any(|t| n.ends_with(t))
+        }));
+        assert_eq!(names("codex-").len(), 9);
+        assert!(backups.join("claude-notes.txt").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn repeated_installs_do_not_accumulate_backups() {
+        let home = root();
+        let agent = AgentTarget::Claude;
+        let layout = layout(&home, agent).unwrap();
+        for round in 0..8 {
+            write_atomic(&layout.config, format!("{{\"round\":{round}}}").as_bytes()).unwrap();
+            install(&home, agent, &home.join(format!("soundx-{round}.exe"))).ok();
+            let _ = remove(&home, agent);
+        }
+        let count = std::fs::read_dir(home.join(".soundx/backups"))
+            .unwrap()
+            .count();
+        assert!(count <= KEEP_BACKUPS, "{count}");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn home_path_only_creates_when_asked() {
+        let base = root();
+        let missing = base.join("typo/nested");
+        assert!(home_path(Some(missing.clone()), false).is_err());
+        assert!(!missing.exists());
+        assert!(!base.join("typo").exists());
+        assert!(home_path(Some(missing.clone()), true).is_ok());
+        assert!(missing.is_dir());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

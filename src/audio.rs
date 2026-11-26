@@ -255,14 +255,16 @@ impl AudioBuffer {
         }
 
         let samples = match spec.sample_format {
-            SampleFormat::Float => reader
-                .samples::<f32>()
-                .map(|sample| {
-                    sample
-                        .map(|value| value.clamp(-1.0, 1.0))
-                        .map_err(anyhow::Error::from)
-                })
-                .collect::<Result<Vec<_>>>()?,
+            // Floating-point samples are kept as-is: values above full scale are
+            // legitimate headroom and must survive until something quantizes them.
+            SampleFormat::Float => {
+                let samples = reader
+                    .samples::<f32>()
+                    .map(|sample| sample.map_err(anyhow::Error::from))
+                    .collect::<Result<Vec<_>>>()?;
+                ensure_finite_samples(&samples, "32-bit float WAV")?;
+                samples
+            }
             SampleFormat::Int => read_int_samples(&mut reader, spec.bits_per_sample)?,
         };
 
@@ -283,6 +285,7 @@ impl AudioBuffer {
         if !matches!(bits, 8 | 16 | 24 | 32) || (float && bits != 32) {
             bail!("WAV output requires 8, 16, 24, or 32 bits; float requires 32 bits");
         }
+        self.validate()?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -317,6 +320,25 @@ impl AudioBuffer {
         }
         writer.finalize()?;
         Ok(())
+    }
+
+    /// Check that the buffer can be written: a non-zero channel count and sample
+    /// rate, interleaved samples aligned to the channel count, and only finite
+    /// samples (NaN or infinity is an error rather than silently becoming
+    /// silence or full scale). Values above full scale are allowed; integer
+    /// writers clamp them when quantizing and float writers preserve them.
+    pub fn validate(&self) -> Result<()> {
+        if self.spec.channels == 0 || self.spec.sample_rate == 0 {
+            bail!("audio stream must have at least one channel and a non-zero sample rate");
+        }
+        if !self
+            .samples
+            .len()
+            .is_multiple_of(usize::from(self.spec.channels))
+        {
+            bail!("interleaved sample count is not divisible by the channel count");
+        }
+        ensure_finite_samples(&self.samples, "audio stream")
     }
 
     pub fn frames(&self) -> usize {
@@ -405,6 +427,7 @@ impl AudioBuffer {
             decoded.copy_to_vec_interleaved(&mut decoded_samples);
             samples.extend_from_slice(&decoded_samples);
         }
+        ensure_finite_samples(&samples, "decoded audio")?;
 
         let mut audio = Self {
             spec: AudioSpec {
@@ -539,11 +562,14 @@ fn read_float64_wav(path: &Path) -> Result<Option<AudioBuffer>> {
             for _ in 0..sample_count {
                 let mut bytes = [0_u8; 8];
                 file.read_exact(&mut bytes)?;
-                let sample = f64::from_le_bytes(bytes);
+                // No clamping: values above full scale are preserved. A finite
+                // f64 beyond the f32 range would become infinite, so check after
+                // the conversion.
+                let sample = f64::from_le_bytes(bytes) as f32;
                 if !sample.is_finite() {
-                    bail!("64-bit float WAV contains NaN or infinite samples");
+                    bail!("64-bit float WAV contains NaN, infinite or out-of-range samples");
                 }
-                samples.push(sample.clamp(-1.0, 1.0) as f32);
+                samples.push(sample);
             }
             return Ok(Some(AudioBuffer {
                 spec: AudioSpec {
@@ -640,17 +666,30 @@ fn decode_au_floats<const N: usize>(bytes: &[u8]) -> Result<Vec<f32>> {
     if !bytes.len().is_multiple_of(N) {
         bail!("truncated AU floating-point sample");
     }
-    let samples = bytes
+    let samples: Vec<f32> = bytes
         .chunks_exact(N)
         .map(|chunk| {
             if N == 4 {
-                f32::from_be_bytes(chunk.try_into().unwrap()).clamp(-1.0, 1.0)
+                f32::from_be_bytes(chunk.try_into().unwrap())
             } else {
                 f64::from_be_bytes(chunk.try_into().unwrap()) as f32
             }
         })
         .collect();
+    ensure_finite_samples(&samples, "AU floating-point input")?;
     Ok(samples)
+}
+
+/// Reject NaN and infinite samples with a readable error. Floating-point
+/// readers call this instead of clamping, so over-full-scale values survive.
+pub(crate) fn ensure_finite_samples(samples: &[f32], what: &str) -> Result<()> {
+    if let Some(index) = samples.iter().position(|sample| !sample.is_finite()) {
+        bail!(
+            "{what} contains a NaN, infinite or out-of-range sample (sample index {index}, value {})",
+            samples[index]
+        );
+    }
+    Ok(())
 }
 
 fn decode_mulaw(sample: u8) -> i16 {
@@ -700,6 +739,8 @@ fn raw_sample_bytes(encoding: RawEncoding) -> usize {
     }
 }
 
+/// Quantize a sample to a signed `bits`-bit integer. This is where samples
+/// above full scale are clamped to [-1, 1]; floating-point paths never clamp.
 pub(crate) fn quantize_pcm(sample: f32, bits: u32) -> i64 {
     let midpoint = 1_i64 << (bits - 1);
     let min = -midpoint;
@@ -783,11 +824,6 @@ fn decode_raw_float<const N: usize>(bytes: &[u8], big_endian: bool) -> Result<Ve
             }
         })
         .collect();
-    if samples.iter().any(|sample| !sample.is_finite()) {
-        bail!("RAW floating-point input contains NaN or infinite samples");
-    }
-    Ok(samples
-        .into_iter()
-        .map(|sample| sample.clamp(-1.0, 1.0))
-        .collect())
+    ensure_finite_samples(&samples, "RAW floating-point input")?;
+    Ok(samples)
 }

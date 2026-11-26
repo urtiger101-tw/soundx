@@ -1,4 +1,4 @@
-# soundx (soundx) Roadmap
+# soundx Roadmap
 
 ## Implemented foundation (partial SoX compatibility)
 

@@ -108,7 +108,7 @@ Limiter 會降低整體響度，因此啟動時增益會自動微調（最多 4 
 | `trim` | 裁剪音訊區段 |
 | `fade` | 淡入淡出 |
 | `reverse` | 反轉音訊 |
-| `speed` | 變速（線性插值） |
+| `speed` | 變速（帶限 windowed-sinc 重取樣，音高隨之改變） |
 | `stretch` / `tempo` | WSOLA 時間伸縮，保留近似音高 |
 | `dither` | TPDF 抖動並量化到指定位元深度 |
 | `compand` | attack/decay 包絡與 dB transfer curve 壓縮 |

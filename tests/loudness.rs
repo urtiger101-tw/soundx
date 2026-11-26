@@ -566,7 +566,8 @@ fn loudness_options_are_validated() {
     must_fail(&["convert", i, o, "--loudness-target=-90"]);
     must_fail(&["convert", i, o, "--loudness-target=-18", "--true-peak=2"]);
     must_fail(&["stream", i, o, "--loudness-target=-18", "--gain-db=3"]);
-    must_fail(&["stream", i, o, "--bits", "24"]);
+    // `--bits`/`--float` are valid on the plain stream path; `--stat-json` is not.
+    must_fail(&["stream", i, o, "--stat-json"]);
 }
 
 #[test]
